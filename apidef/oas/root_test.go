@@ -82,14 +82,110 @@ func TestXTykAPIGateway(t *testing.T) {
 		xTykAPIGateway := XTykAPIGateway{}
 		xTykAPIGateway.Fill(initialAPI)
 
-		ss, _ := json.MarshalIndent(xTykAPIGateway, "", "  ")
-		fmt.Println(string(ss))
+		ss, err := json.MarshalIndent(xTykAPIGateway, "", "  ")
+		assert.NoError(t, err)
+
+		t.Logf("JSON from filled old:\n%s", string(ss))
 
 		var convertedAPI apidef.APIDefinition
 		xTykAPIGateway.ExtractTo(&convertedAPI)
 
 		assert.Equal(t, initialAPI, convertedAPI)
 	})
+}
+
+func TestXTykAPIGateway_EnableContextVariables(t *testing.T) {
+	t.Parallel()
+	enabledExpectation := XTykAPIGateway{
+		Middleware: &Middleware{
+			Global: &Global{
+				ContextVariables: &ContextVariables{
+					Enabled: true,
+				},
+			},
+		},
+	}
+	disabledExpectation := XTykAPIGateway{
+		Middleware: &Middleware{
+			Global: &Global{
+				ContextVariables: &ContextVariables{
+					Enabled: false,
+				},
+			},
+		},
+	}
+	testCases := []struct {
+		name   string
+		in     XTykAPIGateway
+		expect XTykAPIGateway
+	}{
+		{
+			name:   "empty XTykAPIGateway",
+			in:     XTykAPIGateway{},
+			expect: enabledExpectation,
+		},
+		{
+			name: "empty XTykAPIGateway.Middleware",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{},
+			},
+			expect: enabledExpectation,
+		},
+		{
+			name: "empty XTykAPIGateway.Middleware.Global",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{},
+				},
+			},
+			expect: enabledExpectation,
+		},
+		{
+			name: "empty XTykAPIGateway.Middleware.Global.ContextVariables",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{
+						ContextVariables: &ContextVariables{},
+					},
+				},
+			},
+			expect: disabledExpectation,
+		},
+		{
+			name: "enabled XTykAPIGateway.Middleware.Global.ContextVariables",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{
+						ContextVariables: &ContextVariables{
+							Enabled: true,
+						},
+					},
+				},
+			},
+			expect: enabledExpectation,
+		},
+		{
+			name: "disabled XTykAPIGateway.Middleware.Global.ContextVariables",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{
+						ContextVariables: &ContextVariables{
+							Enabled: false,
+						},
+					},
+				},
+			},
+			expect: disabledExpectation,
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.in.enableContextVariablesIfEmpty()
+			assert.EqualExportedValues(t, tc.expect, tc.in)
+		})
+	}
 }
 
 func TestInfo(t *testing.T) {
@@ -118,6 +214,7 @@ func TestState(t *testing.T) {
 
 // Fill populates the given input with non-default values. Index is where to start incrementing values.
 func Fill(t *testing.T, input interface{}, index int) {
+	t.Helper()
 	v := reflect.ValueOf(input).Elem()
 
 	switch kind := v.Type().Kind(); kind {
@@ -187,7 +284,76 @@ func Fill(t *testing.T, input interface{}, index int) {
 	}
 }
 
+// getNonEmptyFields returns non-empty fields inside a struct.
+func getNonEmptyFields(data interface{}, prefix string) (fields []string) {
+	val := reflect.ValueOf(data)
+	if val.Kind() != reflect.Struct {
+		fields = append(fields, prefix)
+		return
+	}
+
+	for i := 0; i < val.NumField(); i++ {
+		field := val.Field(i)
+		fieldType := val.Type().Field(i)
+
+		fieldName := fieldType.Name
+		fullName := prefix + "." + fieldName
+
+		switch field.Kind() {
+		case reflect.String:
+			if field.String() != "" {
+				fields = append(fields, fullName)
+			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			if field.Int() != 0 {
+				fields = append(fields, fullName)
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			if field.Uint() != 0 {
+				fields = append(fields, fullName)
+			}
+		case reflect.Float32, reflect.Float64:
+			if field.Float() != 0 {
+				fields = append(fields, fullName)
+			}
+		case reflect.Bool:
+			if field.Bool() {
+				fields = append(fields, fullName)
+			}
+		case reflect.Struct:
+			fields = append(fields, getNonEmptyFields(field.Interface(), fullName)...)
+		case reflect.Array, reflect.Slice:
+			for j := 0; j < field.Len(); j++ {
+				elemFullName := fullName + fmt.Sprintf("[%d]", j)
+				fields = append(fields, getNonEmptyFields(field.Index(j).Interface(), elemFullName)...)
+				break
+			}
+
+		case reflect.Map:
+			for _, key := range field.MapKeys() {
+				elemFullName := fullName + "[0]"
+				fields = append(fields, getNonEmptyFields(field.MapIndex(key).Interface(), elemFullName)...)
+				break
+			}
+		case reflect.Interface:
+			if !field.IsNil() {
+				fields = append(fields, getNonEmptyFields(field.Elem().Interface(), fullName)...)
+			}
+		case reflect.Ptr:
+			if !field.IsNil() {
+				fields = append(fields, getNonEmptyFields(field.Elem().Interface(), fullName)...)
+			}
+		default:
+			panic(fmt.Sprintf("unsupported kind: %v", field.Kind()))
+		}
+
+	}
+
+	return fields
+}
+
 func FillTestAuthConfigs(t *testing.T, index int) map[string]apidef.AuthConfig {
+	t.Helper()
 	authConfigs := make(map[string]apidef.AuthConfig)
 
 	a := apidef.AuthConfig{}
@@ -208,6 +374,7 @@ func FillTestAuthConfigs(t *testing.T, index int) map[string]apidef.AuthConfig {
 }
 
 func FillTestVersionData(t *testing.T, index int) apidef.VersionData {
+	t.Helper()
 	versionInfo := apidef.VersionInfo{}
 	Fill(t, &versionInfo, index)
 
@@ -232,4 +399,98 @@ func TestVersioning(t *testing.T) {
 	resultVersioning.Fill(convertedAPI)
 
 	assert.Equal(t, emptyVersioning, resultVersioning)
+}
+
+func TestXTykAPIGateway_enableTrafficLogsIfEmpty(t *testing.T) {
+	t.Parallel()
+	enabledExpectation := XTykAPIGateway{
+		Middleware: &Middleware{
+			Global: &Global{
+				TrafficLogs: &TrafficLogs{
+					Enabled: true,
+				},
+			},
+		},
+	}
+	disabledExpectation := XTykAPIGateway{
+		Middleware: &Middleware{
+			Global: &Global{
+				TrafficLogs: &TrafficLogs{
+					Enabled: false,
+				},
+			},
+		},
+	}
+	testCases := []struct {
+		name   string
+		in     XTykAPIGateway
+		expect XTykAPIGateway
+	}{
+		{
+			name:   "empty XTykAPIGateway",
+			in:     XTykAPIGateway{},
+			expect: enabledExpectation,
+		},
+		{
+			name: "empty XTykAPIGateway.Middleware",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{},
+			},
+			expect: enabledExpectation,
+		},
+		{
+			name: "empty XTykAPIGateway.Middleware.Global",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{},
+				},
+			},
+			expect: enabledExpectation,
+		},
+		{
+			name: "empty XTykAPIGateway.Middleware.Global.TrafficLogs",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{
+						TrafficLogs: &TrafficLogs{},
+					},
+				},
+			},
+			expect: disabledExpectation,
+		},
+		{
+			name: "enabled XTykAPIGateway.Middleware.Global.TrafficLogs",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{
+						TrafficLogs: &TrafficLogs{
+							Enabled: true,
+						},
+					},
+				},
+			},
+			expect: enabledExpectation,
+		},
+		{
+			name: "disabled XTykAPIGateway.Middleware.Global.TrafficLogs",
+			in: XTykAPIGateway{
+				Middleware: &Middleware{
+					Global: &Global{
+						TrafficLogs: &TrafficLogs{
+							Enabled: false,
+						},
+					},
+				},
+			},
+			expect: disabledExpectation,
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.in.enableTrafficLogsIfEmpty()
+			assert.EqualExportedValues(t, tc.expect, tc.in)
+		})
+	}
 }

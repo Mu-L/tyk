@@ -12,18 +12,21 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"text/template"
+	texttemplate "text/template"
 	"time"
 
-	"github.com/TykTechnologies/storage/persistent/model"
-	"github.com/TykTechnologies/tyk/config"
-	"github.com/TykTechnologies/tyk/rpc"
-
+	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/stretchr/testify/assert"
 
-	redis "github.com/go-redis/redis/v8"
+	persistentmodel "github.com/TykTechnologies/storage/persistent/model"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/apidef/oas"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/ee/middleware/streams"
+	"github.com/TykTechnologies/tyk/internal/model"
+	"github.com/TykTechnologies/tyk/internal/policy"
+	"github.com/TykTechnologies/tyk/rpc"
 	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/user"
 )
@@ -108,7 +111,7 @@ func TestWhitelist(t *testing.T) {
 
 		ts.Run(t, []test.TestCase{
 			// Should mock path
-			{Path: "/reply/", Code: http.StatusOK, BodyMatch: "flump"},
+			{Path: "/reply/", Code: http.StatusForbidden},
 			{Path: "/reply/123", Code: http.StatusOK, BodyMatch: "flump"},
 			// Should get original upstream response
 			{Path: "/get", Code: http.StatusOK, BodyMatch: `"Url":"/get"`},
@@ -149,14 +152,14 @@ func TestWhitelist(t *testing.T) {
 
 		ts.Run(t, []test.TestCase{
 			{Path: "/foo", Code: http.StatusForbidden},
-			{Path: "/foo/", Code: http.StatusOK},
+			{Path: "/foo/", Code: http.StatusForbidden},
 			{Path: "/foo/1", Code: http.StatusOK},
 			{Path: "/foo/1/bar", Code: http.StatusForbidden},
-			{Path: "/foo/1/bar/", Code: http.StatusOK},
+			{Path: "/foo/1/bar/", Code: http.StatusForbidden},
 			{Path: "/foo/1/bar/1", Code: http.StatusOK},
 			{Path: "/", Code: http.StatusForbidden},
 			{Path: "/baz", Code: http.StatusForbidden},
-			{Path: "/baz/", Code: http.StatusOK},
+			{Path: "/baz/", Code: http.StatusForbidden},
 			{Path: "/baz/1", Code: http.StatusOK},
 			{Path: "/baz/1/", Code: http.StatusOK},
 			{Path: "/baz/1/bazz", Code: http.StatusOK},
@@ -237,8 +240,8 @@ func TestGatewayTagsFilter(t *testing.T) {
 		}
 	}
 
-	data := &nestedApiDefinitionList{}
-	data.set([]*apidef.APIDefinition{
+	data := &model.MergedAPIList{}
+	data.SetClassic([]*apidef.APIDefinition{
 		newApiWithTags(false, []string{}),
 		newApiWithTags(true, []string{}),
 		newApiWithTags(true, []string{"a", "b", "c"}),
@@ -248,22 +251,30 @@ func TestGatewayTagsFilter(t *testing.T) {
 
 	assert.Len(t, data.Message, 5)
 
-	// Test NodeIsSegmented=true
-	{
-		enabled := true
-		assert.Len(t, data.filter(enabled), 0)
-		assert.Len(t, data.filter(enabled, "a"), 3)
-		assert.Len(t, data.filter(enabled, "b"), 2)
-		assert.Len(t, data.filter(enabled, "c"), 1)
-	}
-
 	// Test NodeIsSegmented=false
 	{
 		enabled := false
-		assert.Len(t, data.filter(enabled), 5)
-		assert.Len(t, data.filter(enabled, "a"), 5)
-		assert.Len(t, data.filter(enabled, "b"), 5)
-		assert.Len(t, data.filter(enabled, "c"), 5)
+		assert.Len(t, data.Filter(enabled), 5)
+		assert.Len(t, data.Filter(enabled, "a"), 5)
+		assert.Len(t, data.Filter(enabled, "b"), 5)
+		assert.Len(t, data.Filter(enabled, "c"), 5)
+	}
+
+	// Test NodeIsSegmented=true
+	{
+		enabled := true
+		assert.Len(t, data.Filter(enabled), 0)
+		assert.Len(t, data.Filter(enabled, "a"), 3)
+		assert.Len(t, data.Filter(enabled, "b"), 2)
+		assert.Len(t, data.Filter(enabled, "c"), 1)
+	}
+
+	// Test NodeIsSegmented=true, multiple gw tags
+	{
+		enabled := true
+		assert.Len(t, data.Filter(enabled), 0)
+		assert.Len(t, data.Filter(enabled, "a", "b"), 3)
+		assert.Len(t, data.Filter(enabled, "b", "c"), 2)
 	}
 }
 
@@ -406,13 +417,15 @@ func TestConflictingPaths(t *testing.T) {
 
 	ts.Run(t, []test.TestCase{
 		// Should ignore auth check
-		{Method: "POST", Path: "/customer-servicing/documents/metadata/purge", Code: http.StatusOK},
-		{Method: "GET", Path: "/customer-servicing/documents/metadata/{id}", Code: http.StatusOK},
+		{Method: "POST", Path: "/metadata/purge", Code: http.StatusOK},
+		{Method: "GET", Path: "/metadata/{id}", Code: http.StatusOK},
 	}...)
 }
 
 func TestIgnored(t *testing.T) {
-	ts := StartTest(nil)
+	ts := StartTest(func(c *config.Config) {
+		c.HttpServerOptions.EnablePathPrefixMatching = true
+	})
 	defer ts.Close()
 
 	t.Run("Extended Paths", func(t *testing.T) {
@@ -439,14 +452,13 @@ func TestIgnored(t *testing.T) {
 			{Path: "/ignored/literal", Code: http.StatusOK},
 			{Path: "/ignored/123/test", Code: http.StatusOK},
 			// Only GET is ignored
-			{Method: "POST", Path: "/ext/ignored/literal", Code: 401},
+			{Method: "POST", Path: "/ext/ignored/literal", Code: http.StatusUnauthorized},
 
-			{Path: "/", Code: 401},
+			{Path: "/", Code: http.StatusUnauthorized},
 		}...)
 	})
 
 	t.Run("Simple Paths", func(t *testing.T) {
-
 		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
 				v.Paths.Ignored = []string{"/ignored/literal", "/ignored/{id}/test"}
@@ -461,15 +473,14 @@ func TestIgnored(t *testing.T) {
 			// Should ignore auth check
 			{Path: "/ignored/literal", Code: http.StatusOK},
 			{Path: "/ignored/123/test", Code: http.StatusOK},
-			// All methods ignored
-			{Method: "POST", Path: "/ext/ignored/literal", Code: http.StatusOK},
 
-			{Path: "/", Code: 401},
+			{Method: "POST", Path: "/ext/ignored/literal", Code: http.StatusUnauthorized},
+
+			{Path: "/", Code: http.StatusUnauthorized},
 		}...)
 	})
 
 	t.Run("With URL rewrite", func(t *testing.T) {
-
 		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 			UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
 				v.ExtendedPaths.URLRewrite = []apidef.URLRewriteMeta{{
@@ -504,7 +515,6 @@ func TestIgnored(t *testing.T) {
 	})
 
 	t.Run("Case Sensitivity", func(t *testing.T) {
-
 		spec := BuildAPI(func(spec *APISpec) {
 			UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
 				v.ExtendedPaths.Ignored = []apidef.EndPointMeta{{Path: "/Foo", IgnoreCase: false}, {Path: "/bar", IgnoreCase: true}}
@@ -658,6 +668,7 @@ func TestOldMockResponse(t *testing.T) {
 	}
 
 	check := func(t *testing.T, api *APISpec, tc []test.TestCase) {
+		t.Helper()
 		ts.Gw.LoadAPI(api)
 		_, _ = ts.Run(t, tc...)
 
@@ -816,8 +827,6 @@ func TestWhitelistMethodWithAdditionalMiddleware(t *testing.T) {
 					}
 				]`), &v.ExtendedPaths.TransformResponseHeader)
 			})
-			spec.ResponseProcessors = []apidef.ResponseProcessor{{Name: "header_injector"}}
-
 		})
 
 		//headers := map[string]string{"foo": "bar"}
@@ -859,7 +868,7 @@ func TestSyncAPISpecsDashboardSuccess(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	msg := redis.Message{Payload: `{"Command": "ApiUpdated"}`}
+	msg := testMessageAdapter{Msg: `{"Command": "ApiUpdated"}`}
 	handled := func(got NotificationCommand) {
 		if want := NoticeApiUpdated; got != want {
 			t.Fatalf("want %q, got %q", want, got)
@@ -948,7 +957,7 @@ func TestDefaultVersion(t *testing.T) {
 	ts := StartTest(nil)
 	defer ts.Close()
 
-	key := ts.testPrepareDefaultVersion()
+	key, api := ts.testPrepareDefaultVersion()
 	authHeaders := map[string]string{"authorization": key}
 
 	ts.Run(t, []test.TestCase{
@@ -957,6 +966,19 @@ func TestDefaultVersion(t *testing.T) {
 		{Path: "/foo?v=v1", Headers: authHeaders, Code: http.StatusOK},        // Allowed for v1
 		{Path: "/bar?v=v1", Headers: authHeaders, Code: http.StatusForbidden}, // Not allowed for v1
 	}...)
+
+	t.Run("fallback to default", func(t *testing.T) {
+		_, _ = ts.Run(t, test.TestCase{
+			Path: "/bar?v=notFound", Headers: authHeaders, BodyMatch: string(VersionDoesNotExist), Code: http.StatusForbidden,
+		})
+
+		api.VersionDefinition.FallbackToDefault = true
+		ts.Gw.LoadAPI(api)
+
+		_, _ = ts.Run(t, test.TestCase{
+			Path: "/bar?v=notFound", Headers: authHeaders, Code: http.StatusOK,
+		})
+	})
 }
 
 func BenchmarkDefaultVersion(b *testing.B) {
@@ -965,7 +987,7 @@ func BenchmarkDefaultVersion(b *testing.B) {
 	ts := StartTest(nil)
 	defer ts.Close()
 
-	key := ts.testPrepareDefaultVersion()
+	key, _ := ts.testPrepareDefaultVersion()
 
 	authHeaders := map[string]string{"authorization": key}
 
@@ -982,9 +1004,9 @@ func BenchmarkDefaultVersion(b *testing.B) {
 	}
 }
 
-func (ts *Test) testPrepareDefaultVersion() string {
+func (ts *Test) testPrepareDefaultVersion() (string, *APISpec) {
 
-	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+	api := ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
 		v1 := apidef.VersionInfo{Name: "v1"}
 		v1.Name = "v1"
 		v1.Paths.WhiteList = []string{"/foo"}
@@ -1002,19 +1024,21 @@ func (ts *Test) testPrepareDefaultVersion() string {
 		spec.Proxy.ListenPath = "/"
 
 		spec.UseKeylessAccess = false
-	})
+		spec.DisableRateLimit = true
+		spec.DisableQuota = true
+	})[0]
 
 	return CreateSession(ts.Gw, func(s *user.SessionState) {
 		s.AccessRights = map[string]user.AccessDefinition{"test": {
 			APIID: "test", Versions: []string{"v1", "v2"},
 		}}
-	})
+	}), api
 }
 
 func TestGetVersionFromRequest(t *testing.T) {
 
 	versionInfo := apidef.VersionInfo{}
-	versionInfo.Paths.WhiteList = []string{"/foo"}
+	versionInfo.Paths.WhiteList = []string{"/foo", "/v3/foo"}
 	versionInfo.Paths.BlackList = []string{"/bar"}
 
 	t.Run("Header location", func(t *testing.T) {
@@ -1197,7 +1221,7 @@ func TestSyncAPISpecsDashboardJSONFailure(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	msg := redis.Message{Payload: `{"Command": "ApiUpdated"}`}
+	msg := testMessageAdapter{Msg: `{"Command": "ApiUpdated"}`}
 	handled := func(got NotificationCommand) {
 		if want := NoticeApiUpdated; got != want {
 			t.Fatalf("want %q, got %q", want, got)
@@ -1241,9 +1265,10 @@ func TestAPIDefinitionLoader(t *testing.T) {
 
 	l := APIDefinitionLoader{Gw: ts.Gw}
 
-	executeAndAssert := func(t *testing.T, template *template.Template) {
+	executeAndAssert := func(t *testing.T, tpl *texttemplate.Template) {
+		t.Helper()
 		var bodyBuffer bytes.Buffer
-		err := template.Execute(&bodyBuffer, map[string]string{
+		err := tpl.Execute(&bodyBuffer, map[string]string{
 			"value1": "value-1",
 			"value2": "value-2",
 		})
@@ -1318,23 +1343,6 @@ func TestAPIExpiration(t *testing.T) {
 			})
 		})
 	}
-}
-
-func TestStripListenPath(t *testing.T) {
-	assert.Equal(t, "/get", stripListenPath("/listen", "/listen/get"))
-	assert.Equal(t, "/get", stripListenPath("/listen/", "/listen/get"))
-	assert.Equal(t, "/get", stripListenPath("listen", "listen/get"))
-	assert.Equal(t, "/get", stripListenPath("listen/", "listen/get"))
-	assert.Equal(t, "/", stripListenPath("/listen/", "/listen/"))
-	assert.Equal(t, "/", stripListenPath("/listen", "/listen"))
-	assert.Equal(t, "/", stripListenPath("listen/", ""))
-
-	assert.Equal(t, "/get", stripListenPath("/{_:.*}/post/", "/listen/post/get"))
-	assert.Equal(t, "/get", stripListenPath("/{_:.*}/", "/listen/get"))
-	assert.Equal(t, "/get", stripListenPath("/pre/{_:.*}/", "/pre/listen/get"))
-	assert.Equal(t, "/", stripListenPath("/{_:.*}", "/listen"))
-	assert.Equal(t, "/get", stripListenPath("/{myPattern:foo|bar}", "/foo/get"))
-	assert.Equal(t, "/anything/get", stripListenPath("/{myPattern:foo|bar}", "/anything/get"))
 }
 
 func TestAPISpec_SanitizeProxyPaths(t *testing.T) {
@@ -1443,13 +1451,13 @@ func TestAPISpec_isListeningOnPort(t *testing.T) {
 func Test_LoadAPIsFromRPC(t *testing.T) {
 	ts := StartTest(nil)
 	defer ts.Close()
-	objectID := model.NewObjectID()
+	objectID := persistentmodel.NewObjectID()
 	loader := APIDefinitionLoader{Gw: ts.Gw}
 
 	t.Run("load APIs from RPC - success", func(t *testing.T) {
-		mockedStorage := &RPCDataLoaderMock{
+		mockedStorage := &policy.RPCDataLoaderMock{
 			ShouldConnect: true,
-			Apis: []nestedApiDefinition{
+			Apis: []model.MergedAPI{
 				{APIDefinition: &apidef.APIDefinition{Id: objectID, OrgID: "org1", APIID: "api1"}},
 			},
 		}
@@ -1461,9 +1469,9 @@ func Test_LoadAPIsFromRPC(t *testing.T) {
 	})
 
 	t.Run("load APIs from RPC - success - then fail", func(t *testing.T) {
-		mockedStorage := &RPCDataLoaderMock{
+		mockedStorage := &policy.RPCDataLoaderMock{
 			ShouldConnect: true,
-			Apis: []nestedApiDefinition{
+			Apis: []model.MergedAPI{
 				{APIDefinition: &apidef.APIDefinition{Id: objectID, OrgID: "org1", APIID: "api1"}},
 			},
 		}
@@ -1488,4 +1496,164 @@ func Test_LoadAPIsFromRPC(t *testing.T) {
 		assert.NoError(t, err, "error loading APIs from RPC:", err)
 		assert.Equal(t, 1, len(apisMap), "expected 0 APIs to be loaded from RPC backup")
 	})
+}
+
+func TestAPISpec_setHasMock(t *testing.T) {
+	s := APISpec{APIDefinition: &apidef.APIDefinition{}}
+
+	s.setHasMock()
+	assert.False(t, s.HasMock)
+
+	s.IsOAS = true
+	s.setHasMock()
+	assert.False(t, s.HasMock)
+
+	s.OAS = oas.OAS{}
+	s.setHasMock()
+	assert.False(t, s.HasMock)
+
+	xTyk := &oas.XTykAPIGateway{}
+	s.OAS.SetTykExtension(xTyk)
+	s.setHasMock()
+	assert.False(t, s.HasMock)
+
+	middleware := &oas.Middleware{}
+	xTyk.Middleware = middleware
+	s.setHasMock()
+	assert.False(t, s.HasMock)
+
+	op := &oas.Operation{}
+	middleware.Operations = oas.Operations{
+		"my-operation": op,
+	}
+	s.setHasMock()
+	assert.False(t, s.HasMock)
+
+	mock := &oas.MockResponse{}
+	op.MockResponse = mock
+	s.setHasMock()
+	assert.False(t, s.HasMock)
+
+	mock.Enabled = true
+	s.setHasMock()
+	assert.True(t, s.HasMock)
+}
+
+func TestAPISpec_isStreamingAPI(t *testing.T) {
+	type testCase struct {
+		name           string
+		inputOAS       oas.OAS
+		expectedResult bool
+	}
+
+	testCases := []testCase{
+		{
+			name:           "should return false if oas is set to default",
+			inputOAS:       oas.OAS{},
+			expectedResult: false,
+		},
+		{
+			name: "should return false if streaming section is missing",
+			inputOAS: oas.OAS{
+				T: openapi3.T{
+					Extensions: map[string]any{
+						"x-tyk-api-gateway": nil,
+					},
+				},
+			},
+			expectedResult: false,
+		},
+		{
+			name: "should return true if streaming section is present",
+			inputOAS: oas.OAS{
+				T: openapi3.T{
+					Extensions: map[string]any{
+						streams.ExtensionTykStreaming: nil,
+						"x-tyk-api-gateway":           nil,
+					},
+				},
+			},
+			expectedResult: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			apiSpec := &APISpec{
+				OAS: tc.inputOAS,
+			}
+			assert.Equal(t, tc.expectedResult, apiSpec.isStreamingAPI())
+		})
+	}
+}
+
+func TestReplaceSecrets(t *testing.T) {
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.Secrets = map[string]string{
+			"Laurentiu": "Ghiur",
+		}
+	})
+	defer ts.Close()
+
+	t.Setenv("Furkan", "Şenharputlu")
+	t.Setenv("Leonid", "Bugaev")
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		spec.APIID = "1"
+		spec.JWTSource = "env://Furkan"
+		spec.JWTSigningMethod = "secrets://Laurentiu"
+	}, func(spec *APISpec) {
+		spec.APIID = "2"
+		spec.AuthConfigs = map[string]apidef.AuthConfig{
+			apidef.BasicType: {
+				AuthHeaderName: "env://Leonid",
+			},
+			apidef.AuthTokenType: {
+				AuthHeaderName: "env://Furkan",
+			},
+			apidef.OAuthType: {
+				AuthHeaderName: "secrets://Laurentiu",
+			},
+		}
+	})
+
+	api1 := ts.Gw.getApiSpec("1")
+	api2 := ts.Gw.getApiSpec("2")
+	assert.Equal(t, "Şenharputlu", api1.JWTSource)
+	assert.Equal(t, "Bugaev", api2.AuthConfigs[apidef.BasicType].AuthHeaderName)
+	assert.Equal(t, "Şenharputlu", api2.AuthConfigs[apidef.AuthTokenType].AuthHeaderName)
+	assert.Equal(t, "Ghiur", api1.JWTSigningMethod)
+	assert.Equal(t, "Ghiur", api2.AuthConfigs[apidef.OAuthType].AuthHeaderName)
+}
+
+func TestInternalEndpointMW_TT_11126(t *testing.T) {
+	ts := StartTest(nil)
+	defer ts.Close()
+
+	ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+		UpdateAPIVersion(spec, "v1", func(v *apidef.VersionInfo) {
+			assert.NoError(t, json.Unmarshal([]byte(`[
+                    {
+                        "disabled": false,
+                        "add_headers": {
+                            "New-Header": "Value"
+                        },
+                        "path": "/headers",
+                        "method": "GET"
+                    }
+                ]`), &v.ExtendedPaths.TransformHeader))
+			assert.NoError(t, json.Unmarshal([]byte(`[
+                        {
+                            "path": "/headers",
+                            "method": "GET",
+                            "disabled": false
+						}
+				]`), &v.ExtendedPaths.Internal))
+		})
+		spec.Proxy.ListenPath = "/"
+	})
+
+	_, _ = ts.Run(t, []test.TestCase{
+		{Path: "/headers", Code: http.StatusForbidden},
+	}...)
 }

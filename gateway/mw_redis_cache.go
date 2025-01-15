@@ -29,7 +29,7 @@ const (
 
 // RedisCacheMiddleware is a caching middleware that will pull data from Redis instead of the upstream proxy
 type RedisCacheMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 
 	store storage.Handler
 	sh    SuccessHandler
@@ -146,6 +146,7 @@ func (m *RedisCacheMiddleware) decodePayload(payload string) (string, string, er
 type cacheOptions struct {
 	key                    string
 	cacheOnlyResponseCodes []int
+	timeout                int64
 }
 
 // ProcessRequest will run any checks on the request on the way through the system, return an error to have the chain fail
@@ -193,14 +194,23 @@ func (m *RedisCacheMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Req
 	}
 
 	cacheOnlyResponseCodes := m.Spec.CacheOptions.CacheOnlyResponseCodes
-	// override api main CacheOnlyResponseCodes by endpoint specific if provided
-	if cacheMeta != nil && len(cacheMeta.CacheOnlyResponseCodes) > 0 {
-		cacheOnlyResponseCodes = cacheMeta.CacheOnlyResponseCodes
+	timeout := m.Spec.CacheOptions.CacheTimeout
+	if cacheMeta != nil {
+		// override api level CacheOnlyResponseCodes by endpoint level if provided
+		if len(cacheMeta.CacheOnlyResponseCodes) > 0 {
+			cacheOnlyResponseCodes = cacheMeta.CacheOnlyResponseCodes
+		}
+
+		// override api level Timout by endpoint level if provided
+		if cacheMeta.Timeout > 0 {
+			timeout = cacheMeta.Timeout
+		}
 	}
 
 	ctxSetCacheOptions(r, &cacheOptions{
 		key:                    key,
 		cacheOnlyResponseCodes: cacheOnlyResponseCodes,
+		timeout:                timeout,
 	})
 
 	retBlob, err = m.store.GetKey(key)
@@ -265,7 +275,7 @@ func (m *RedisCacheMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Req
 	// Record analytics
 	if !m.Spec.DoNotTrack {
 		ms := DurationToMillisecond(time.Since(t1))
-		m.sh.RecordHit(r, analytics.Latency{Total: int64(ms)}, newRes.StatusCode, newRes)
+		m.sh.RecordHit(r, analytics.Latency{Total: int64(ms)}, newRes.StatusCode, newRes, true)
 	}
 
 	// Stop any further execution after we wrote cache out

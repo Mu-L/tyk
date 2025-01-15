@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,7 +16,9 @@ import (
 	"time"
 )
 
+type TestCases []TestCase
 type TestCase struct {
+	Host    string `json:",omitempty"`
 	Method  string `json:",omitempty"`
 	Path    string `json:",omitempty"`
 	BaseURL string `json:",omitempty"`
@@ -33,14 +36,15 @@ type TestCase struct {
 	Cookies         []*http.Cookie    `json:",omitempty"`
 	Delay           time.Duration     `json:",omitempty"`
 	BodyMatch       string            `json:",omitempty"` // regex
-	BodyMatchFunc   func([]byte) bool `json:",omitempty"`
 	BodyNotMatch    string            `json:",omitempty"`
 	HeadersMatch    map[string]string `json:",omitempty"`
 	HeadersNotMatch map[string]string `json:",omitempty"`
 	JSONMatch       map[string]string `json:",omitempty"`
 	ErrorMatch      string            `json:",omitempty"`
-	BeforeFn        func()            `json:"-"`
-	Client          *http.Client      `json:"-"`
+
+	BodyMatchFunc func([]byte) bool `json:"-"`
+	BeforeFn      func()            `json:"-"`
+	Client        *http.Client      `json:"-"`
 
 	AdminAuth      bool `json:",omitempty"`
 	ControlRequest bool `json:",omitempty"`
@@ -195,8 +199,8 @@ type nopCloser struct {
 // to have it ready for next read-cycle
 func (n nopCloser) Read(p []byte) (int, error) {
 	num, err := n.ReadSeeker.Read(p)
-	if err == io.EOF { // move to start to have it ready for next read cycle
-		n.Seek(0, io.SeekStart)
+	if errors.Is(err, io.EOF) { // move to start to have it ready for next read cycle
+		_, _ = n.Seek(0, io.SeekStart)
 	}
 	return num, err
 }
@@ -275,16 +279,26 @@ func (r HTTPTestRunner) Run(t testing.TB, testCases ...TestCase) (*http.Response
 	}
 
 	for ti, tc := range testCases {
-		req, err := r.RequestBuilder(&tc)
+		var tc *TestCase = &tc
+
+		if tc.BeforeFn != nil {
+			tc.BeforeFn()
+		}
+
+		req, err := r.RequestBuilder(tc)
 		if err != nil {
 			t.Errorf("[%d] Request build error: %s", ti, err.Error())
 			continue
 		}
 
+		if tc.Host != "" {
+			req.Host = tc.Host
+		}
+
 		retryCount := 0
 	retry:
 
-		lastResponse, lastError = r.Do(req, &tc)
+		lastResponse, lastError = r.Do(req, tc)
 		tcJSON, _ := json.Marshal(tc)
 
 		if lastError != nil {
@@ -307,13 +321,11 @@ func (r HTTPTestRunner) Run(t testing.TB, testCases ...TestCase) (*http.Response
 		}
 
 		respCopy := copyResponse(lastResponse)
-		if lastError = r.Assert(respCopy, &tc); lastError != nil {
+		if lastError = r.Assert(respCopy, tc); lastError != nil {
 			t.Errorf("[%d] %s. %s\n", ti, lastError.Error(), string(tcJSON))
 		}
 
-		delay := tc.Delay
-
-		if delay > 0 {
+		if delay := tc.Delay; delay > 0 {
 			time.Sleep(delay)
 		}
 	}

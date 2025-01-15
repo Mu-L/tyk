@@ -4,13 +4,27 @@
 package goplugin_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
+	"github.com/TykTechnologies/tyk/user"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/assert"
+
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/apidef/oas"
 	"github.com/TykTechnologies/tyk/gateway"
 	"github.com/TykTechnologies/tyk/test"
 )
+
+func goPluginFilename() string {
+	if test.IsRaceEnabled() {
+		return "../test/goplugins/goplugins_race.so"
+	}
+	return "../test/goplugins/goplugins.so"
+}
 
 /*func TestMain(m *testing.M) {
 	os.Exit(gateway.InitTestMain(context.Background(), m))
@@ -36,23 +50,23 @@ func TestGoPluginMWs(t *testing.T) {
 			Pre: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginPre",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 			AuthCheck: apidef.MiddlewareDefinition{
 				Name: "MyPluginAuthCheck",
-				Path: "../test/goplugins/goplugins.so",
+				Path: goPluginFilename(),
 			},
 			PostKeyAuth: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginPostKeyAuth",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 			Post: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginPost",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 		}
@@ -71,23 +85,23 @@ func TestGoPluginMWs(t *testing.T) {
 			Pre: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginPre",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 			AuthCheck: apidef.MiddlewareDefinition{
 				Name: "MyPluginAuthCheck",
-				Path: "../test/goplugins/goplugins.so",
+				Path: goPluginFilename(),
 			},
 			PostKeyAuth: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginPostKeyAuth",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 			Post: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginPost",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 		}
@@ -106,21 +120,21 @@ func TestGoPluginMWs(t *testing.T) {
 				{
 					Disabled: true,
 					Name:     "MyPluginPre",
-					Path:     "../test/goplugins/goplugins.so",
+					Path:     goPluginFilename(),
 				},
 			},
 			PostKeyAuth: []apidef.MiddlewareDefinition{
 				{
 					Disabled: true,
 					Name:     "MyPluginPostKeyAuth",
-					Path:     "../test/goplugins/goplugins.so",
+					Path:     goPluginFilename(),
 				},
 			},
 			Post: []apidef.MiddlewareDefinition{
 				{
 					Disabled: true,
 					Name:     "MyPluginPost",
-					Path:     "../test/goplugins/goplugins.so",
+					Path:     goPluginFilename(),
 				},
 			},
 		}
@@ -141,26 +155,26 @@ func TestGoPluginMWs(t *testing.T) {
 					{
 						Disabled: true,
 						Name:     "MyPluginPre",
-						Path:     "../test/goplugins/goplugins.so",
+						Path:     goPluginFilename(),
 					},
 				},
 				AuthCheck: apidef.MiddlewareDefinition{
 					Disabled: true,
 					Name:     "MyPluginAuthCheck",
-					Path:     "../test/goplugins/goplugins.so",
+					Path:     goPluginFilename(),
 				},
 				PostKeyAuth: []apidef.MiddlewareDefinition{
 					{
 						Disabled: true,
 						Name:     "MyPluginPostKeyAuth",
-						Path:     "../test/goplugins/goplugins.so",
+						Path:     goPluginFilename(),
 					},
 				},
 				Post: []apidef.MiddlewareDefinition{
 					{
 						Disabled: true,
 						Name:     "MyPluginPost",
-						Path:     "../test/goplugins/goplugins.so",
+						Path:     goPluginFilename(),
 					},
 				},
 			}
@@ -282,7 +296,7 @@ func TestGoPluginResponseHook(t *testing.T) {
 			Response: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginResponse",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 		}
@@ -322,21 +336,21 @@ func TestGoPluginPerPathSingleFile(t *testing.T) {
 		goPluginMetaFoo := apidef.GoPluginMeta{
 			Path:       "/foo",
 			Method:     "GET",
-			PluginPath: "../test/goplugins/goplugins.so",
+			PluginPath: goPluginFilename(),
 			SymbolName: "MyPluginPerPathFoo",
 		}
 
 		goPluginMetaBar := apidef.GoPluginMeta{
 			Path:       "/bar",
 			Method:     "GET",
-			PluginPath: "../test/goplugins/goplugins.so",
+			PluginPath: goPluginFilename(),
 			SymbolName: "MyPluginPerPathBar",
 		}
 
 		goPluginMetaResp := apidef.GoPluginMeta{
 			Path:       "/resp",
 			Method:     "GET",
-			PluginPath: "../test/goplugins/goplugins.so",
+			PluginPath: goPluginFilename(),
 			SymbolName: "MyPluginPerPathResp",
 		}
 
@@ -344,7 +358,7 @@ func TestGoPluginPerPathSingleFile(t *testing.T) {
 			Disabled:   true,
 			Path:       "/disabled",
 			Method:     "GET",
-			PluginPath: "../test/goplugins/goplugins.so",
+			PluginPath: goPluginFilename(),
 			SymbolName: "MyPluginPerPathResp",
 		}
 
@@ -417,14 +431,14 @@ func TestGoPluginAPIandPerPath(t *testing.T) {
 			Pre: []apidef.MiddlewareDefinition{
 				{
 					Name: "MyPluginPre",
-					Path: "../test/goplugins/goplugins.so",
+					Path: goPluginFilename(),
 				},
 			},
 		}
 		goPluginMetaFoo := apidef.GoPluginMeta{
 			Path:       "/foo",
 			Method:     "GET",
-			PluginPath: "../test/goplugins/goplugins.so",
+			PluginPath: goPluginFilename(),
 			SymbolName: "MyPluginPerPathFoo",
 		}
 		v := spec.VersionData.Versions["v1"]
@@ -494,4 +508,118 @@ func TestGoPluginMiddleware_ProcessRequest_ShouldFailWhenNotLoaded(t *testing.T)
 			{Path: "/my-plugin", Code: http.StatusInternalServerError, BodyMatch: http.StatusText(http.StatusInternalServerError)},
 		}...)
 	})
+}
+
+func TestGoPlugin_AccessingOASAPIDef(t *testing.T) {
+	ts := gateway.StartTest(nil)
+	defer ts.Close()
+
+	const oasDocTitle = "My OAS Documentation"
+
+	oasDoc := oas.OAS{}
+	oasDoc.OpenAPI = "3.0.3"
+	oasDoc.Info = &openapi3.Info{
+		Version: "1",
+		Title:   oasDocTitle,
+	}
+	oasDoc.Paths = openapi3.Paths{}
+
+	oasDoc.SetTykExtension(&oas.XTykAPIGateway{})
+
+	err := oasDoc.Validate(context.Background())
+	assert.NoError(t, err)
+
+	ts.Gw.BuildAndLoadAPI(func(spec *gateway.APISpec) {
+		spec.IsOAS = true
+		spec.OAS = oasDoc
+		spec.Proxy.ListenPath = "/oas-goplugin/"
+		spec.UseKeylessAccess = true
+		spec.UseStandardAuth = false
+		spec.CustomMiddleware = apidef.MiddlewareSection{
+			Driver: apidef.GoPluginDriver,
+			Pre: []apidef.MiddlewareDefinition{
+				{
+					Name: "MyPluginAccessingOASAPI",
+					Path: goPluginFilename(),
+				},
+			},
+		}
+	})
+
+	ts.Run(t, []test.TestCase{
+		{
+			Path: "/oas-goplugin/get",
+			Code: http.StatusOK,
+			HeadersMatch: map[string]string{
+				"X-OAS-Doc-Title": oasDocTitle,
+			},
+		},
+	}...)
+}
+
+func TestGoPlugin_PreventDoubleError(t *testing.T) {
+	ts := gateway.StartTest(nil)
+	defer ts.Close()
+
+	ts.Gw.BuildAndLoadAPI(func(spec *gateway.APISpec) {
+		spec.Proxy.ListenPath = "/my-goplugin/"
+		spec.UseKeylessAccess = true
+		spec.UseStandardAuth = false
+		spec.CustomMiddleware = apidef.MiddlewareSection{
+			Driver: apidef.GoPluginDriver,
+			Pre: []apidef.MiddlewareDefinition{
+				{
+					Name: "MyPluginReturningError",
+					Path: goPluginFilename(),
+				},
+			},
+		}
+	})
+
+	ts.Run(t, []test.TestCase{
+		{
+			Path: "/my-goplugin/get",
+			Code: http.StatusTeapot,
+			BodyMatchFunc: func(bytes []byte) bool {
+				assert.Equal(t, http.StatusText(http.StatusTeapot), string(bytes))
+				return true
+			},
+		},
+	}...)
+}
+
+func TestGoPlugin_ApplyPolicy(t *testing.T) {
+	ts := gateway.StartTest(nil)
+	defer ts.Close()
+
+	ts.CreatePolicy(func(p *user.Policy) {
+		p.ID = "my-pol"
+		p.Rate = 114
+	})
+
+	ts.Gw.BuildAndLoadAPI(func(spec *gateway.APISpec) {
+		spec.Proxy.ListenPath = "/my-goplugin/"
+		spec.UseKeylessAccess = true
+		spec.UseStandardAuth = false
+		spec.CustomMiddleware = apidef.MiddlewareSection{
+			Driver: apidef.GoPluginDriver,
+			Pre: []apidef.MiddlewareDefinition{
+				{
+					Name: "MyPluginApplyingPolicy",
+					Path: goPluginFilename(),
+				},
+			},
+		}
+	})
+
+	ts.Run(t, []test.TestCase{
+		{
+			Path: "/my-goplugin/get",
+			Code: http.StatusOK,
+		},
+	}...)
+
+	session, found := ts.Gw.GlobalSessionManager.SessionDetail("", "my-key", false)
+	assert.True(t, found)
+	assert.Equal(t, float64(114), session.Rate)
 }

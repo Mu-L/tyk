@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/TykTechnologies/tyk/coprocess"
 
 	"github.com/stretchr/testify/assert"
@@ -239,4 +241,10 @@ func equalHeaders(h1, h2 []*coprocess.Header) bool {
 		delete(m, h.Key)
 	}
 	return len(m) == 0
+}
+
+func TestCoProcessMiddlewareName(t *testing.T) {
+	m := &CoProcessMiddleware{}
+
+	require.Equal(t, "CoProcessMiddleware", m.Name(), "Name method did not return the expected value")
 }

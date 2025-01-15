@@ -4,12 +4,28 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
 
 	"github.com/getkin/kin-openapi/openapi3filter"
 )
 
+func init() {
+	openapi3.SchemaErrorDetailsDisabled = true
+	openapi3.DefineStringFormatCallback("date-time", func(value string) error {
+		_, err := time.Parse(time.RFC3339, value)
+		return err
+	})
+
+	openapi3.DefineStringFormatCallback("date", func(value string) error {
+		_, err := time.Parse(time.DateOnly, value)
+		return err
+	})
+}
+
 type ValidateRequest struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (k *ValidateRequest) Name() string {
@@ -75,7 +91,7 @@ func (k *ValidateRequest) ProcessRequest(w http.ResponseWriter, r *http.Request,
 
 	err := openapi3filter.ValidateRequest(r.Context(), requestValidationInput)
 	if err != nil {
-		return fmt.Errorf("request validation error: %v", err), errResponseCode
+		return fmt.Errorf("request validation error: %w", err), errResponseCode
 	}
 
 	// Handle Success

@@ -14,11 +14,15 @@ import (
 )
 
 type ResponseGoPluginMiddleware struct {
+	BaseTykResponseHandler
 	Path       string // path to .so file
 	SymbolName string // function symbol to look up
 	logger     *logrus.Entry
-	Spec       *APISpec
 	ResHandler func(rw http.ResponseWriter, res *http.Response, req *http.Request)
+}
+
+func (h ResponseGoPluginMiddleware) Base() *BaseTykResponseHandler {
+	return &h.BaseTykResponseHandler
 }
 
 func (ResponseGoPluginMiddleware) Name() string {
@@ -41,7 +45,7 @@ func (h *ResponseGoPluginMiddleware) Init(c interface{}, spec *APISpec) error {
 		return nil
 	}
 
-	newPath, err := goplugin.GetPluginFileNameToLoad(goplugin.FileSystemStorage{}, h.Path, VERSION)
+	newPath, err := goplugin.GetPluginFileNameToLoad(goplugin.FileSystemStorage{}, h.Path)
 	if err != nil {
 		h.logger.WithError(err).Error("Could not load Go-plugin. File was not found")
 		return err

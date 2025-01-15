@@ -10,7 +10,7 @@ import (
 )
 
 type MiddlewareContextVars struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (m *MiddlewareContextVars) Name() string {
@@ -44,6 +44,13 @@ func (m *MiddlewareContextVars) ProcessRequest(w http.ResponseWriter, r *http.Re
 	for _, c := range r.Cookies() {
 		name := "cookies_" + strings.Replace(c.Name, "-", "_", -1)
 		contextDataObject[name] = c.Value
+	}
+
+	for key, vals := range r.Form {
+		name := "request_data_" + strings.Replace(key, "-", "_", -1)
+		if len(vals) > 0 {
+			contextDataObject[name] = vals[0]
+		}
 	}
 
 	ctxSetData(r, contextDataObject)

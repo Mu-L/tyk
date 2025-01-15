@@ -95,12 +95,6 @@ func (h *handleWrapper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if NewRelicApplication != nil {
-		txn := NewRelicApplication.StartTransaction(r.URL.Path, w, r)
-		defer txn.End()
-		h.router.ServeHTTP(txn, r)
-		return
-	}
 	h.router.ServeHTTP(w, r)
 }
 
@@ -293,7 +287,11 @@ func (gw *Gateway) flushNetworkAnalytics(ctx context.Context) {
 					APIID:        spec.APIID,
 					OrgID:        spec.OrgID,
 				}
-				record.SetExpiry(spec.ExpireAnalyticsAfter)
+				if spec.DisableExpireAnalytics {
+					record.SetExpiry(0)
+				} else {
+					record.SetExpiry(spec.ExpireAnalyticsAfter)
+				}
 				_ = gw.Analytics.RecordHit(&record)
 			}
 			gw.apisMu.RUnlock()
@@ -471,6 +469,9 @@ func (m *proxyMux) serve(gw *Gateway) {
 				ReadTimeout:  readTimeout,
 				WriteTimeout: writeTimeout,
 				Handler:      handler,
+			}
+			if gw.ConnectionWatcher != nil {
+				p.httpServer.ConnState = gw.ConnectionWatcher.OnStateChange
 			}
 
 			if conf.CloseConnections {

@@ -1,9 +1,10 @@
 package gateway
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/TykTechnologies/gojsonschema"
@@ -11,7 +12,7 @@ import (
 )
 
 type ValidateJSON struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 func (k *ValidateJSON) Name() string {
@@ -48,18 +49,20 @@ func (k *ValidateJSON) ProcessRequest(w http.ResponseWriter, r *http.Request, _ 
 		}
 	}
 
+	nopCloseRequestBody(r)
 	// Load input body into gojsonschema
-	bodyBytes, err := ioutil.ReadAll(r.Body)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		return err, http.StatusBadRequest
 	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 	defer r.Body.Close()
 	inputLoader := gojsonschema.NewBytesLoader(bodyBytes)
 
 	// Perform validation
 	result, err := gojsonschema.Validate(vPathMeta.SchemaCache, inputLoader)
 	if err != nil {
-		return fmt.Errorf("JSON parsing error: %v", err), http.StatusBadRequest
+		return fmt.Errorf("JSON parsing error: %w", err), http.StatusBadRequest
 	}
 
 	// Handle Failure

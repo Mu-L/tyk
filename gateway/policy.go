@@ -17,9 +17,13 @@ import (
 	"github.com/TykTechnologies/tyk/user"
 )
 
+var (
+	ErrPoliciesFetchFailed = errors.New("fetch policies request login failure")
+)
+
 type DBAccessDefinition struct {
-	APIName              string                       `json:"apiname"`
-	APIID                string                       `json:"apiid"`
+	APIName              string                       `json:"api_name"`
+	APIID                string                       `json:"api_id"`
 	Versions             []string                     `json:"versions"`
 	AllowedURLs          []user.AccessSpec            `bson:"allowed_urls" json:"allowed_urls"` // mapped string MUST be a valid regex
 	RestrictedTypes      []graphql.Type               `json:"restricted_types"`
@@ -27,6 +31,9 @@ type DBAccessDefinition struct {
 	DisableIntrospection bool                         `json:"disable_introspection"`
 	FieldAccessRights    []user.FieldAccessDefinition `json:"field_access_rights"`
 	Limit                *user.APILimit               `json:"limit"`
+
+	// Endpoints contains endpoint rate limit settings.
+	Endpoints user.Endpoints `json:"endpoints,omitempty"`
 }
 
 func (d *DBAccessDefinition) ToRegularAD() user.AccessDefinition {
@@ -39,6 +46,7 @@ func (d *DBAccessDefinition) ToRegularAD() user.AccessDefinition {
 		AllowedTypes:         d.AllowedTypes,
 		DisableIntrospection: d.DisableIntrospection,
 		FieldAccessRights:    d.FieldAccessRights,
+		Endpoints:            d.Endpoints,
 	}
 
 	if d.Limit != nil {
@@ -62,13 +70,13 @@ func (d *DBPolicy) ToRegularPolicy() user.Policy {
 	return policy
 }
 
-func LoadPoliciesFromFile(filePath string) map[string]user.Policy {
+func LoadPoliciesFromFile(filePath string) (map[string]user.Policy, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"prefix": "policy",
 		}).Error("Couldn't open policy file: ", err)
-		return nil
+		return nil, err
 	}
 	defer f.Close()
 
@@ -77,14 +85,20 @@ func LoadPoliciesFromFile(filePath string) map[string]user.Policy {
 		log.WithFields(logrus.Fields{
 			"prefix": "policy",
 		}).Error("Couldn't unmarshal policies: ", err)
+		return nil, err
 	}
-	return policies
+	return policies, nil
 }
 
-func LoadPoliciesFromDir(dir string) map[string]user.Policy {
+func LoadPoliciesFromDir(dir string) (map[string]user.Policy, error) {
 	policies := make(map[string]user.Policy)
 	// Grab json files from directory
-	paths, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	paths, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
+		log.Error("error fetch policies path from policies path: ", err)
+		return nil, err
+	}
+
 	for _, path := range paths {
 		log.Info("Loading policy from dir ", path)
 		f, err := os.Open(path)
@@ -99,16 +113,17 @@ func LoadPoliciesFromDir(dir string) map[string]user.Policy {
 		f.Close()
 		policies[pol.ID] = *pol
 	}
-	return policies
+	return policies, nil
 }
 
 // LoadPoliciesFromDashboard will connect and download Policies from a Tyk Dashboard instance.
-func (gw *Gateway) LoadPoliciesFromDashboard(endpoint, secret string, allowExplicit bool) map[string]user.Policy {
+func (gw *Gateway) LoadPoliciesFromDashboard(endpoint, secret string, allowExplicit bool) (map[string]user.Policy, error) {
 
 	// Get the definitions
 	newRequest, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Error("Failed to create request: ", err)
+		return nil, err
 	}
 
 	newRequest.Header.Set("authorization", secret)
@@ -129,7 +144,7 @@ func (gw *Gateway) LoadPoliciesFromDashboard(endpoint, secret string, allowExpli
 	resp, err := c.Do(newRequest)
 	if err != nil {
 		log.Error("Policy request failed: ", err)
-		return nil
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -137,7 +152,7 @@ func (gw *Gateway) LoadPoliciesFromDashboard(endpoint, secret string, allowExpli
 		body, _ := ioutil.ReadAll(resp.Body)
 		log.Error("Policy request login failure, Response was: ", string(body))
 		gw.reLogin()
-		return nil
+		return nil, ErrPoliciesFetchFailed
 	}
 
 	// Extract Policies
@@ -147,7 +162,7 @@ func (gw *Gateway) LoadPoliciesFromDashboard(endpoint, secret string, allowExpli
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		log.Error("Failed to decode policy body: ", err)
-		return nil
+		return nil, err
 	}
 
 	gw.ServiceNonceMutex.Lock()
@@ -177,7 +192,7 @@ func (gw *Gateway) LoadPoliciesFromDashboard(endpoint, secret string, allowExpli
 		policies[id] = p.ToRegularPolicy()
 	}
 
-	return policies
+	return policies, err
 }
 
 func parsePoliciesFromRPC(list string, allowExplicit bool) (map[string]user.Policy, error) {

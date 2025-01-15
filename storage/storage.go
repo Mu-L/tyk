@@ -17,10 +17,16 @@ import (
 	"github.com/TykTechnologies/tyk/internal/uuid"
 )
 
+//go:generate mockgen -destination=./mock/storage.go -package mock . Handler
+
 var log = logger.Get()
 
 // ErrKeyNotFound is a standard error for when a key is not found in the storage engine
 var ErrKeyNotFound = errors.New("key not found")
+
+var ErrMDCBConnectionLost = errors.New("mdcb connection is lost")
+
+const MongoBsonIdLength = 24
 
 // Handler is a standard interface to a storage backend, used by
 // AuthorisationManager to read and write key values to the backend
@@ -36,6 +42,7 @@ type Handler interface {
 	DeleteKey(string) bool
 	DeleteAllKeys() bool
 	DeleteRawKey(string) bool
+	DeleteRawKeys([]string) bool
 	Connect() bool
 	GetKeysAndValues() map[string]string
 	GetKeysAndValuesWithFilter(string) map[string]string
@@ -125,8 +132,12 @@ func TokenOrg(token string) string {
 	}
 
 	// 24 is mongo bson id length
-	if len(token) > 24 {
-		return token[:24]
+	if len(token) > MongoBsonIdLength {
+		newToken := token[:MongoBsonIdLength]
+		_, err := hex.DecodeString(newToken)
+		if err == nil {
+			return newToken
+		}
 	}
 
 	return ""

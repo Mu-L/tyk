@@ -5,6 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/TykTechnologies/tyk/internal/httputil"
+
+	"github.com/TykTechnologies/tyk/apidef/oas"
+
 	"github.com/TykTechnologies/tyk/config"
 
 	"github.com/TykTechnologies/tyk/apidef"
@@ -17,6 +21,7 @@ type Key uint
 
 const (
 	SessionData Key = iota
+	// Deprecated: UpdateSession was used to trigger a session update, use *SessionData.Touch instead.
 	UpdateSession
 	AuthToken
 	HashedAuthToken
@@ -47,12 +52,9 @@ const (
 
 	// CacheOptions holds cache options required for cache writer middleware.
 	CacheOptions
+	OASDefinition
+	SelfLooping
 )
-
-func setContext(r *http.Request, ctx context.Context) {
-	r2 := r.WithContext(ctx)
-	*r = *r2
-}
 
 func ctxSetSession(r *http.Request, s *user.SessionState, scheduleUpdate bool, hashKey bool) {
 
@@ -72,11 +74,12 @@ func ctxSetSession(r *http.Request, s *user.SessionState, scheduleUpdate bool, h
 	ctx = context.WithValue(ctx, SessionData, s)
 
 	ctx = context.WithValue(ctx, AuthToken, s.KeyID)
+
 	if scheduleUpdate {
-		ctx = context.WithValue(ctx, UpdateSession, true)
+		s.Touch()
 	}
 
-	setContext(r, ctx)
+	httputil.SetContext(r, ctx)
 }
 
 func GetAuthToken(r *http.Request) string {
@@ -114,7 +117,7 @@ func SetSession(r *http.Request, s *user.SessionState, scheduleUpdate bool, hash
 func SetDefinition(r *http.Request, s *apidef.APIDefinition) {
 	ctx := r.Context()
 	ctx = context.WithValue(ctx, Definition, s)
-	setContext(r, ctx)
+	httputil.SetContext(r, ctx)
 }
 
 func GetDefinition(r *http.Request) *apidef.APIDefinition {
@@ -132,4 +135,24 @@ func GetDefinition(r *http.Request) *apidef.APIDefinition {
 		}
 	}
 	return nil
+}
+
+// GetOASDefinition returns a deep copy of the OAS definition of the called API.
+func GetOASDefinition(r *http.Request) *oas.OAS {
+	v := r.Context().Value(OASDefinition)
+	if v == nil {
+		return nil
+	}
+
+	val, ok := v.(*oas.OAS)
+	if !ok {
+		return nil
+	}
+
+	ret, err := val.Clone()
+	if err != nil {
+		logger.Get().WithError(err).Error("Cloning OAS object in the request context")
+	}
+
+	return ret
 }

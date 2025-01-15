@@ -23,3 +23,12 @@ func InternalServerError(w http.ResponseWriter, _ *http.Request) {
 	status := http.StatusInternalServerError
 	http.Error(w, http.StatusText(status), status)
 }
+
+// RemoveResponseTransferEncoding will remove a transfer encoding hint from the response.
+func RemoveResponseTransferEncoding(response *http.Response, victim string) {
+	for i, value := range response.TransferEncoding {
+		if value == victim {
+			response.TransferEncoding = append(response.TransferEncoding[:i], response.TransferEncoding[i+1:]...)
+		}
+	}
+}

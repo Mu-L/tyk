@@ -2,6 +2,7 @@ package linter
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -23,7 +24,7 @@ func Run(schm string, paths []string) (string, []string, error) {
 	schemaLoader := schema.NewBytesLoader([]byte(schm))
 
 	var orig map[string]interface{}
-	f, err := os.Open(conf.OriginalPath)
+	f, err := os.Open(conf.Private.OriginalPath)
 	if err != nil {
 		return "", nil, err
 	}
@@ -46,11 +47,11 @@ func Run(schm string, paths []string) (string, []string, error) {
 	}
 
 	// ensure it's well formatted and the keys are all lowercase
-	if err := config.WriteConf(conf.OriginalPath, &conf); err != nil {
+	if err := config.WriteConf(conf.Private.OriginalPath, &conf); err != nil {
 		return "", nil, err
 	}
 
-	return conf.OriginalPath, resultWarns(result), nil
+	return conf.Private.OriginalPath, resultWarns(result), nil
 }
 
 type stringFormat func(string) bool
@@ -70,7 +71,8 @@ func addFormats(chain *schema.FormatCheckerChain) {
 	}))
 	chain.Add("host-no-port", stringFormat(func(host string) bool {
 		_, port, err := net.SplitHostPort(host)
-		if a, ok := err.(*net.AddrError); ok && a.Err == "missing port in address" {
+		var a *net.AddrError
+		if errors.As(err, &a) && a.Err == "missing port in address" {
 			// port being missing is ok
 			err = nil
 		}

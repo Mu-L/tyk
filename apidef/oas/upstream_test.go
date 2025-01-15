@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/time"
 )
 
 func TestCacheOptions(t *testing.T) {
@@ -95,16 +96,42 @@ func TestCacheOptions(t *testing.T) {
 }
 
 func TestUpstream(t *testing.T) {
-	var emptyUpstream Upstream
+	t.Run("empty", func(t *testing.T) {
+		var emptyUpstream Upstream
 
-	var convertedAPI apidef.APIDefinition
-	convertedAPI.SetDisabledFlags()
-	emptyUpstream.ExtractTo(&convertedAPI)
+		var convertedAPI apidef.APIDefinition
+		convertedAPI.SetDisabledFlags()
+		emptyUpstream.ExtractTo(&convertedAPI)
 
-	var resultUpstream Upstream
-	resultUpstream.Fill(convertedAPI)
+		var resultUpstream Upstream
+		resultUpstream.Fill(convertedAPI)
 
-	assert.Equal(t, emptyUpstream, resultUpstream)
+		assert.Equal(t, emptyUpstream, resultUpstream)
+	})
+
+	t.Run("rate limit", func(t *testing.T) {
+		t.Run("valid duration", func(t *testing.T) {
+			rateLimitUpstream := Upstream{
+				RateLimit: &RateLimit{
+					Enabled: true,
+					Rate:    10,
+					Per:     ReadableDuration(time.Hour + 20*time.Minute + 10*time.Second),
+				},
+			}
+
+			var convertedAPI apidef.APIDefinition
+			convertedAPI.SetDisabledFlags()
+			rateLimitUpstream.ExtractTo(&convertedAPI)
+
+			assert.Equal(t, float64(4810), convertedAPI.GlobalRateLimit.Per)
+
+			var resultUpstream Upstream
+			resultUpstream.Fill(convertedAPI)
+
+			assert.Equal(t, rateLimitUpstream, resultUpstream)
+		})
+
+	})
 }
 
 func TestServiceDiscovery(t *testing.T) {
@@ -442,5 +469,197 @@ func TestCertificatePinning(t *testing.T) {
 		resultCertificatePinning.Fill(convertedAPI)
 
 		assert.Equal(t, emptyCertificatePinnning, resultCertificatePinning)
+	})
+}
+
+func TestLoadBalancing(t *testing.T) {
+	t.Parallel()
+	t.Run("fill", func(t *testing.T) {
+		t.Parallel()
+		testcases := []struct {
+			title    string
+			input    apidef.APIDefinition
+			expected *LoadBalancing
+		}{
+			{
+				title: "disable load balancing when targets list is empty",
+				input: apidef.APIDefinition{
+					Proxy: apidef.ProxyConfig{
+						EnableLoadBalancing: true,
+						Targets:             []string{},
+					},
+				},
+				expected: nil,
+			},
+			{
+				title: "load balancing disabled with filled target list",
+				input: apidef.APIDefinition{
+					Proxy: apidef.ProxyConfig{
+						EnableLoadBalancing: false,
+						Targets: []string{
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-three",
+							"http://upstream-three",
+						},
+					},
+				},
+				expected: &LoadBalancing{
+					Enabled: false,
+					Targets: []LoadBalancingTarget{
+						{
+							URL:    "http://upstream-one",
+							Weight: 5,
+						},
+						{
+							URL:    "http://upstream-three",
+							Weight: 2,
+						},
+					},
+				},
+			},
+			{
+				title: "load balancing enabled with filled target list",
+				input: apidef.APIDefinition{
+					Proxy: apidef.ProxyConfig{
+						EnableLoadBalancing: true,
+						Targets: []string{
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-one",
+							"http://upstream-three",
+							"http://upstream-three",
+						},
+					},
+				},
+				expected: &LoadBalancing{
+					Enabled: true,
+					Targets: []LoadBalancingTarget{
+						{
+							URL:    "http://upstream-one",
+							Weight: 5,
+						},
+						{
+							URL:    "http://upstream-three",
+							Weight: 2,
+						},
+					},
+				},
+			},
+		}
+
+		for _, tc := range testcases {
+			tc := tc
+			t.Run(tc.title, func(t *testing.T) {
+				t.Parallel()
+
+				g := new(Upstream)
+				g.Fill(tc.input)
+
+				assert.Equal(t, tc.expected, g.LoadBalancing)
+			})
+		}
+	})
+
+	t.Run("extractTo", func(t *testing.T) {
+		t.Parallel()
+
+		testcases := []struct {
+			title           string
+			input           *LoadBalancing
+			expectedEnabled bool
+			expectedTargets []string
+		}{
+			{
+				title: "disable load balancing when targets list is empty",
+				input: &LoadBalancing{
+					Enabled: false,
+					Targets: nil,
+				},
+				expectedEnabled: false,
+				expectedTargets: nil,
+			},
+			{
+				title: "load balancing disabled with filled target list",
+				input: &LoadBalancing{
+					Enabled: false,
+					Targets: []LoadBalancingTarget{
+						{
+							URL:    "http://upstream-one",
+							Weight: 5,
+						},
+						{
+							URL:    "http://upstream-two",
+							Weight: 0,
+						},
+						{
+							URL:    "http://upstream-three",
+							Weight: 2,
+						},
+					},
+				},
+				expectedEnabled: false,
+				expectedTargets: []string{
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-three",
+					"http://upstream-three",
+				},
+			},
+			{
+				title: "load balancing enabled with filled target list",
+				input: &LoadBalancing{
+					Enabled: true,
+					Targets: []LoadBalancingTarget{
+						{
+							URL:    "http://upstream-one",
+							Weight: 5,
+						},
+						{
+							URL:    "http://upstream-two",
+							Weight: 0,
+						},
+						{
+							URL:    "http://upstream-three",
+							Weight: 2,
+						},
+					},
+				},
+				expectedEnabled: true,
+				expectedTargets: []string{
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-one",
+					"http://upstream-three",
+					"http://upstream-three",
+				},
+			},
+		}
+
+		for _, tc := range testcases {
+			tc := tc // Creating a new 'tc' scoped to the loop
+			t.Run(tc.title, func(t *testing.T) {
+				t.Parallel()
+
+				g := new(Upstream)
+				g.LoadBalancing = tc.input
+
+				var apiDef apidef.APIDefinition
+				g.ExtractTo(&apiDef)
+
+				assert.Equal(t, tc.expectedEnabled, apiDef.Proxy.EnableLoadBalancing)
+				assert.Equal(t, tc.expectedTargets, apiDef.Proxy.Targets)
+			})
+		}
 	})
 }

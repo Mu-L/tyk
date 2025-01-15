@@ -1,19 +1,21 @@
 package oas
 
 import (
+	"encoding/json"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/TykTechnologies/tyk/apidef"
 )
 
-// Middleware holds configuration for middleware.
+// Middleware holds configuration for Tyk's native middleware.
 type Middleware struct {
-	// Global contains the configurations related to the global middleware.
+	// Global contains configuration for middleware that affects the whole API (all endpoints).
 	Global *Global `bson:"global,omitempty" json:"global,omitempty"`
 
-	// Operations configuration.
+	// Operations contains configuration for middleware that can be applied to individual endpoints within the API (per-endpoint).
 	Operations Operations `bson:"operations,omitempty" json:"operations,omitempty"`
 }
 
@@ -31,39 +33,115 @@ func (m *Middleware) Fill(api apidef.APIDefinition) {
 
 // ExtractTo extracts *Middleware into *apidef.APIDefinition.
 func (m *Middleware) ExtractTo(api *apidef.APIDefinition) {
-	if m.Global != nil {
-		m.Global.ExtractTo(api)
+	if m.Global == nil {
+		m.Global = &Global{}
+		defer func() {
+			m.Global = nil
+		}()
 	}
+
+	m.Global.ExtractTo(api)
 }
 
-// Global holds configuration applies globally: CORS and caching.
+// Global contains configuration that affects the whole API (all endpoints).
 type Global struct {
-	// PluginConfig contains the configuration related custom plugin bundles/driver.
+	// PluginConfig contains the common configuration for custom plugins.
 	PluginConfig *PluginConfig `bson:"pluginConfig,omitempty" json:"pluginConfig,omitempty"`
 
-	// CORS contains the configuration related to cross origin resource sharing.
+	// CORS contains the configuration related to Cross Origin Resource Sharing.
 	// Tyk classic API definition: `CORS`.
 	CORS *CORS `bson:"cors,omitempty" json:"cors,omitempty"`
 
-	// PrePlugin contains configuration related to custom pre-authentication plugin.
-	// Tyk classic API definition: `custom_middleware.pre`.
+	// PrePlugin contains configuration related to the custom plugin that is run before authentication.
+	// Deprecated: Use PrePlugins instead.
 	PrePlugin *PrePlugin `bson:"prePlugin,omitempty" json:"prePlugin,omitempty"`
 
-	// PostAuthenticationPlugin contains configuration related to custom post authentication plugin.
-	// Tyk classic API definition: `custom_middleware.post_key_auth`.
+	// PrePlugins contains configuration related to the custom plugin that is run before authentication.
+	// Tyk classic API definition: `custom_middleware.pre`.
+	PrePlugins CustomPlugins `bson:"prePlugins,omitempty" json:"prePlugins,omitempty"`
+
+	// PostAuthenticationPlugin contains configuration related to the custom plugin that is run immediately after authentication.
+	// Deprecated: Use PostAuthenticationPlugins instead.
 	PostAuthenticationPlugin *PostAuthenticationPlugin `bson:"postAuthenticationPlugin,omitempty" json:"postAuthenticationPlugin,omitempty"`
 
-	// PostPlugin contains configuration related to custom post plugin.
-	// Tyk classic API definition: `custom_middleware.post`.
+	// PostAuthenticationPlugins contains configuration related to the custom plugin that is run immediately after authentication.
+	// Tyk classic API definition: `custom_middleware.post_key_auth`.
+	PostAuthenticationPlugins CustomPlugins `bson:"postAuthenticationPlugins,omitempty" json:"postAuthenticationPlugins,omitempty"`
+
+	// PostPlugin contains configuration related to the custom plugin that is run immediately prior to proxying the request to the upstream.
+	// Deprecated: Use PostPlugins instead.
 	PostPlugin *PostPlugin `bson:"postPlugin,omitempty" json:"postPlugin,omitempty"`
 
-	// ResponsePlugin contains configuration related to custom post plugin.
-	// Tyk classic API definition: `custom_middleware.response`.
+	// PostPlugins contains configuration related to the custom plugin that is run immediately prior to proxying the request to the upstream.
+	// Tyk classic API definition: `custom_middleware.post`.
+	PostPlugins CustomPlugins `bson:"postPlugins,omitempty" json:"postPlugins,omitempty"`
+
+	// ResponsePlugin contains configuration related to the custom plugin that is run during processing of the response from the upstream service.
+	// Deprecated: Use ResponsePlugins instead.
 	ResponsePlugin *ResponsePlugin `bson:"responsePlugin,omitempty" json:"responsePlugin,omitempty"`
+
+	// ResponsePlugins contains configuration related to the custom plugin that is run during processing of the response from the upstream service.
+	//
+	// Tyk classic API definition: `custom_middleware.response`.
+	ResponsePlugins CustomPlugins `bson:"responsePlugins,omitempty" json:"responsePlugins,omitempty"`
 
 	// Cache contains the configurations related to caching.
 	// Tyk classic API definition: `cache_options`.
 	Cache *Cache `bson:"cache,omitempty" json:"cache,omitempty"`
+
+	// TransformRequestHeaders contains the configurations related to API level request header transformation.
+	// Tyk classic API definition: `global_headers`/`global_headers_remove`.
+	TransformRequestHeaders *TransformHeaders `bson:"transformRequestHeaders,omitempty" json:"transformRequestHeaders,omitempty"`
+
+	// TransformResponseHeaders contains the configurations related to API level response header transformation.
+	// Tyk classic API definition: `global_response_headers`/`global_response_headers_remove`.
+	TransformResponseHeaders *TransformHeaders `bson:"transformResponseHeaders,omitempty" json:"transformResponseHeaders,omitempty"`
+
+	// ContextVariables contains the configuration related to Tyk context variables.
+	ContextVariables *ContextVariables `bson:"contextVariables,omitempty" json:"contextVariables,omitempty"`
+
+	// TrafficLogs contains the configurations related to API level log analytics.
+	TrafficLogs *TrafficLogs `bson:"trafficLogs,omitempty" json:"trafficLogs,omitempty"`
+
+	// RequestSizeLimit contains the configuration related to limiting the global request size.
+	RequestSizeLimit *GlobalRequestSizeLimit `bson:"requestSizeLimit,omitempty" json:"requestSizeLimit,omitempty"`
+}
+
+// MarshalJSON is a custom JSON marshaler for the Global struct. It is implemented
+// to facilitate a smooth migration from deprecated fields that were previously used to represent
+// the same data. This custom marshaler ensures backwards compatibility and proper handling of the
+// deprecated fields during the migration process.
+func (g *Global) MarshalJSON() ([]byte, error) {
+	if g == nil {
+		return nil, nil
+	}
+
+	type Alias Global
+
+	var payload = Alias(*g)
+
+	if payload.PrePlugin != nil {
+		payload.PrePlugins = payload.PrePlugin.Plugins
+		payload.PrePlugin = nil
+	}
+
+	if payload.PostAuthenticationPlugin != nil {
+		payload.PostAuthenticationPlugins = payload.PostAuthenticationPlugin.Plugins
+		payload.PostAuthenticationPlugin = nil
+	}
+
+	if payload.PostPlugin != nil {
+		payload.PostPlugins = payload.PostPlugin.Plugins
+		payload.PostPlugin = nil
+	}
+
+	if payload.ResponsePlugin != nil {
+		payload.ResponsePlugins = payload.ResponsePlugin.Plugins
+		payload.ResponsePlugin = nil
+	}
+
+	// to prevent infinite recursion
+	return json.Marshal(payload)
 }
 
 // Fill fills *Global from apidef.APIDefinition.
@@ -86,31 +164,25 @@ func (g *Global) Fill(api apidef.APIDefinition) {
 		g.CORS = nil
 	}
 
-	if g.PrePlugin == nil {
-		g.PrePlugin = &PrePlugin{}
+	g.PrePlugins.Fill(api.CustomMiddleware.Pre)
+	g.PrePlugin = nil
+
+	if ShouldOmit(g.PrePlugins) {
+		g.PrePlugins = nil
 	}
 
-	g.PrePlugin.Fill(api)
-	if ShouldOmit(g.PrePlugin) {
-		g.PrePlugin = nil
+	g.PostAuthenticationPlugins.Fill(api.CustomMiddleware.PostKeyAuth)
+	g.PostAuthenticationPlugin = nil
+
+	if ShouldOmit(g.PostAuthenticationPlugins) {
+		g.PostAuthenticationPlugins = nil
 	}
 
-	if g.PostAuthenticationPlugin == nil {
-		g.PostAuthenticationPlugin = &PostAuthenticationPlugin{}
-	}
+	g.PostPlugins.Fill(api.CustomMiddleware.Post)
+	g.PostPlugin = nil
 
-	g.PostAuthenticationPlugin.Fill(api)
-	if ShouldOmit(g.PostAuthenticationPlugin) {
-		g.PostAuthenticationPlugin = nil
-	}
-
-	if g.PostPlugin == nil {
-		g.PostPlugin = &PostPlugin{}
-	}
-
-	g.PostPlugin.Fill(api)
-	if ShouldOmit(g.PostPlugin) {
-		g.PostPlugin = nil
+	if ShouldOmit(g.PostPlugins) {
+		g.PostPlugins = nil
 	}
 
 	if g.Cache == nil {
@@ -122,50 +194,264 @@ func (g *Global) Fill(api apidef.APIDefinition) {
 		g.Cache = nil
 	}
 
-	if g.ResponsePlugin == nil {
-		g.ResponsePlugin = &ResponsePlugin{}
+	g.ResponsePlugins.Fill(api.CustomMiddleware.Response)
+	g.ResponsePlugin = nil
+
+	if ShouldOmit(g.ResponsePlugins) {
+		g.ResponsePlugins = nil
 	}
 
-	g.ResponsePlugin.Fill(api)
-	if ShouldOmit(g.ResponsePlugin) {
-		g.ResponsePlugin = nil
+	if g.TransformRequestHeaders == nil {
+		g.TransformRequestHeaders = &TransformHeaders{}
+	}
+
+	vInfo := api.VersionData.Versions[Main]
+	g.TransformRequestHeaders.Fill(apidef.HeaderInjectionMeta{
+		Disabled:      vInfo.GlobalHeadersDisabled,
+		AddHeaders:    vInfo.GlobalHeaders,
+		DeleteHeaders: vInfo.GlobalHeadersRemove,
+	})
+	if ShouldOmit(g.TransformRequestHeaders) {
+		g.TransformRequestHeaders = nil
+	}
+
+	if g.TransformResponseHeaders == nil {
+		g.TransformResponseHeaders = &TransformHeaders{}
+	}
+
+	g.TransformResponseHeaders.Fill(apidef.HeaderInjectionMeta{
+		Disabled:      vInfo.GlobalResponseHeadersDisabled,
+		AddHeaders:    vInfo.GlobalResponseHeaders,
+		DeleteHeaders: vInfo.GlobalResponseHeadersRemove,
+	})
+	if ShouldOmit(g.TransformResponseHeaders) {
+		g.TransformResponseHeaders = nil
+	}
+
+	g.fillContextVariables(api)
+
+	g.fillTrafficLogs(api)
+
+	g.fillRequestSizeLimit(api)
+}
+
+func (g *Global) fillTrafficLogs(api apidef.APIDefinition) {
+	if g.TrafficLogs == nil {
+		g.TrafficLogs = &TrafficLogs{}
+	}
+
+	g.TrafficLogs.Fill(api)
+	if ShouldOmit(g.TrafficLogs) {
+		g.TrafficLogs = nil
+	}
+}
+
+func (g *Global) fillRequestSizeLimit(api apidef.APIDefinition) {
+	if g.RequestSizeLimit == nil {
+		g.RequestSizeLimit = &GlobalRequestSizeLimit{}
+	}
+
+	g.RequestSizeLimit.Fill(api)
+	if ShouldOmit(g.RequestSizeLimit) {
+		g.RequestSizeLimit = nil
+	}
+}
+
+func (g *Global) fillContextVariables(api apidef.APIDefinition) {
+	if g.ContextVariables == nil {
+		g.ContextVariables = &ContextVariables{}
+	}
+
+	g.ContextVariables.Fill(api)
+	if ShouldOmit(g.ContextVariables) {
+		g.ContextVariables = nil
 	}
 }
 
 // ExtractTo extracts *Global into *apidef.APIDefinition.
 func (g *Global) ExtractTo(api *apidef.APIDefinition) {
-	if g.PluginConfig != nil {
-		g.PluginConfig.ExtractTo(api)
+	if g.PluginConfig == nil {
+		g.PluginConfig = &PluginConfig{}
+		defer func() {
+			g.PluginConfig = nil
+		}()
 	}
 
-	if g.CORS != nil {
-		g.CORS.ExtractTo(&api.CORS)
+	g.PluginConfig.ExtractTo(api)
+
+	if g.CORS == nil {
+		g.CORS = &CORS{}
+		defer func() {
+			g.CORS = nil
+		}()
 	}
 
-	if g.PrePlugin != nil {
-		g.PrePlugin.ExtractTo(api)
+	g.CORS.ExtractTo(&api.CORS)
+
+	g.extractPrePluginsTo(api)
+
+	g.extractPostAuthenticationPluginsTo(api)
+
+	g.extractPostPluginsTo(api)
+
+	if g.Cache == nil {
+		g.Cache = &Cache{}
+		defer func() {
+			g.Cache = nil
+		}()
 	}
 
-	if g.PostAuthenticationPlugin != nil {
-		g.PostAuthenticationPlugin.ExtractTo(api)
+	g.Cache.ExtractTo(&api.CacheOptions)
+
+	g.extractResponsePluginsTo(api)
+
+	g.extractContextVariablesTo(api)
+
+	g.extractTrafficLogsTo(api)
+
+	if g.TransformRequestHeaders == nil {
+		g.TransformRequestHeaders = &TransformHeaders{}
+		defer func() {
+			g.TransformRequestHeaders = nil
+		}()
 	}
 
-	if g.PostPlugin != nil {
-		g.PostPlugin.ExtractTo(api)
+	var headerMeta apidef.HeaderInjectionMeta
+	g.TransformRequestHeaders.ExtractTo(&headerMeta)
+
+	if g.TransformResponseHeaders == nil {
+		g.TransformResponseHeaders = &TransformHeaders{}
+		defer func() {
+			g.TransformResponseHeaders = nil
+		}()
 	}
 
-	if g.Cache != nil {
-		g.Cache.ExtractTo(&api.CacheOptions)
+	var resHeaderMeta apidef.HeaderInjectionMeta
+	g.TransformResponseHeaders.ExtractTo(&resHeaderMeta)
+
+	requireMainVersion(api)
+	vInfo := api.VersionData.Versions[Main]
+	vInfo.GlobalHeadersDisabled = headerMeta.Disabled
+	vInfo.GlobalHeaders = headerMeta.AddHeaders
+	vInfo.GlobalHeadersRemove = headerMeta.DeleteHeaders
+
+	vInfo.GlobalResponseHeadersDisabled = resHeaderMeta.Disabled
+	vInfo.GlobalResponseHeaders = resHeaderMeta.AddHeaders
+	vInfo.GlobalResponseHeadersRemove = resHeaderMeta.DeleteHeaders
+	updateMainVersion(api, vInfo)
+
+	g.extractRequestSizeLimitTo(api)
+}
+
+func (g *Global) extractTrafficLogsTo(api *apidef.APIDefinition) {
+	if g.TrafficLogs == nil {
+		g.TrafficLogs = &TrafficLogs{}
+		defer func() {
+			g.TrafficLogs = nil
+		}()
 	}
 
-	if g.ResponsePlugin != nil {
-		g.ResponsePlugin.ExtractTo(api)
+	g.TrafficLogs.ExtractTo(api)
+}
+
+func (g *Global) extractRequestSizeLimitTo(api *apidef.APIDefinition) {
+	if g.RequestSizeLimit == nil {
+		g.RequestSizeLimit = &GlobalRequestSizeLimit{}
+		defer func() {
+			g.RequestSizeLimit = nil
+		}()
 	}
+
+	g.RequestSizeLimit.ExtractTo(api)
+}
+
+func (g *Global) extractContextVariablesTo(api *apidef.APIDefinition) {
+	if g.ContextVariables == nil {
+		g.ContextVariables = &ContextVariables{}
+		defer func() {
+			g.ContextVariables = nil
+		}()
+	}
+
+	g.ContextVariables.ExtractTo(api)
+}
+
+func (g *Global) extractPrePluginsTo(api *apidef.APIDefinition) {
+	defer func() {
+		g.PrePlugin = nil
+	}()
+
+	// give precedence to PrePlugins over PrePlugin
+	if g.PrePlugins != nil {
+		api.CustomMiddleware.Pre = make([]apidef.MiddlewareDefinition, len(g.PrePlugins))
+		g.PrePlugins.ExtractTo(api.CustomMiddleware.Pre)
+		return
+	}
+
+	if g.PrePlugin == nil {
+		g.PrePlugin = &PrePlugin{}
+	}
+
+	g.PrePlugin.ExtractTo(api)
+}
+
+func (g *Global) extractPostAuthenticationPluginsTo(api *apidef.APIDefinition) {
+	defer func() {
+		g.PostAuthenticationPlugin = nil
+	}()
+
+	if g.PostAuthenticationPlugins != nil {
+		api.CustomMiddleware.PostKeyAuth = make([]apidef.MiddlewareDefinition, len(g.PostAuthenticationPlugins))
+		g.PostAuthenticationPlugins.ExtractTo(api.CustomMiddleware.PostKeyAuth)
+		return
+	}
+
+	if g.PostAuthenticationPlugin == nil {
+		g.PostAuthenticationPlugin = &PostAuthenticationPlugin{}
+	}
+
+	g.PostAuthenticationPlugin.ExtractTo(api)
+}
+
+func (g *Global) extractPostPluginsTo(api *apidef.APIDefinition) {
+	defer func() {
+		g.PostPlugin = nil
+	}()
+
+	if g.PostPlugins != nil {
+		api.CustomMiddleware.Post = make([]apidef.MiddlewareDefinition, len(g.PostPlugins))
+		g.PostPlugins.ExtractTo(api.CustomMiddleware.Post)
+		return
+	}
+
+	if g.PostPlugin == nil {
+		g.PostPlugin = &PostPlugin{}
+	}
+
+	g.PostPlugin.ExtractTo(api)
+}
+
+func (g *Global) extractResponsePluginsTo(api *apidef.APIDefinition) {
+	defer func() {
+		g.ResponsePlugin = nil
+	}()
+
+	if g.ResponsePlugins != nil {
+		api.CustomMiddleware.Response = make([]apidef.MiddlewareDefinition, len(g.ResponsePlugins))
+		g.ResponsePlugins.ExtractTo(api.CustomMiddleware.Response)
+		return
+	}
+
+	if g.ResponsePlugin == nil {
+		g.ResponsePlugin = &ResponsePlugin{}
+	}
+
+	g.ResponsePlugin.ExtractTo(api)
 }
 
 // PluginConfigData configures config data for custom plugins.
 type PluginConfigData struct {
-	// Enabled enables custom plugin config data.
+	// Enabled activates custom plugin config data.
 	Enabled bool `bson:"enabled" json:"enabled"` // required.
 
 	// Value is the value of custom plugin config data.
@@ -186,8 +472,8 @@ func (p *PluginConfigData) ExtractTo(api *apidef.APIDefinition) {
 
 // PluginConfig holds configuration for custom plugins.
 type PluginConfig struct {
-	// Driver configures which custom plugin to be used.
-	// It's value should be set to one of the following:
+	// Driver configures which custom plugin driver to use.
+	// The value should be set to one of the following:
 	//
 	// - `otto`,
 	// - `python`,
@@ -232,18 +518,28 @@ func (p *PluginConfig) Fill(api apidef.APIDefinition) {
 func (p *PluginConfig) ExtractTo(api *apidef.APIDefinition) {
 	api.CustomMiddleware.Driver = p.Driver
 
-	if p.Bundle != nil {
-		p.Bundle.ExtractTo(api)
+	if p.Bundle == nil {
+		p.Bundle = &PluginBundle{}
+		defer func() {
+			p.Bundle = nil
+		}()
 	}
 
-	if p.Data != nil {
-		p.Data.ExtractTo(api)
+	p.Bundle.ExtractTo(api)
+
+	if p.Data == nil {
+		p.Data = &PluginConfigData{}
+		defer func() {
+			p.Data = nil
+		}()
 	}
+
+	p.Data.ExtractTo(api)
 }
 
 // PluginBundle holds configuration for custom plugins.
 type PluginBundle struct {
-	// Enabled enables the custom plugin bundles.
+	// Enabled activates the custom plugin bundles.
 	//
 	// Tyk classic API definition: `custom_middleware_bundle_disabled`
 	Enabled bool `bson:"enabled" json:"enabled"` // required.
@@ -276,7 +572,7 @@ type CORS struct {
 	// Tyk classic API definition: `CORS.max_age`.
 	MaxAge int `bson:"maxAge,omitempty" json:"maxAge,omitempty"`
 
-	// AllowCredentials indicates whether the request can include user credentials like cookies,
+	// AllowCredentials indicates if the request can include user credentials like cookies,
 	// HTTP authentication or client side SSL certificates.
 	//
 	// Tyk classic API definition: `CORS.allow_credentials`.
@@ -526,14 +822,23 @@ func (ps Paths) ExtractTo(ep *apidef.ExtendedPathsSet) {
 
 // Path holds plugin configurations for HTTP method verbs.
 type Path struct {
-	Delete  *Plugins `bson:"DELETE,omitempty" json:"DELETE,omitempty"`
-	Get     *Plugins `bson:"GET,omitempty" json:"GET,omitempty"`
-	Head    *Plugins `bson:"HEAD,omitempty" json:"HEAD,omitempty"`
+	// Delete holds plugin configuration for DELETE requests.
+	Delete *Plugins `bson:"DELETE,omitempty" json:"DELETE,omitempty"`
+	// Get holds plugin configuration for GET requests.
+	Get *Plugins `bson:"GET,omitempty" json:"GET,omitempty"`
+	// Head holds plugin configuration for HEAD requests.
+	Head *Plugins `bson:"HEAD,omitempty" json:"HEAD,omitempty"`
+	// Options holds plugin configuration for OPTIONS requests.
 	Options *Plugins `bson:"OPTIONS,omitempty" json:"OPTIONS,omitempty"`
-	Patch   *Plugins `bson:"PATCH,omitempty" json:"PATCH,omitempty"`
-	Post    *Plugins `bson:"POST,omitempty" json:"POST,omitempty"`
-	Put     *Plugins `bson:"PUT,omitempty" json:"PUT,omitempty"`
-	Trace   *Plugins `bson:"TRACE,omitempty" json:"TRACE,omitempty"`
+	// Patch holds plugin configuration for PATCH requests.
+	Patch *Plugins `bson:"PATCH,omitempty" json:"PATCH,omitempty"`
+	// Post holds plugin configuration for POST requests.
+	Post *Plugins `bson:"POST,omitempty" json:"POST,omitempty"`
+	// Put holds plugin configuration for PUT requests.
+	Put *Plugins `bson:"PUT,omitempty" json:"PUT,omitempty"`
+	// Trace holds plugin configuration for TRACE requests.
+	Trace *Plugins `bson:"TRACE,omitempty" json:"TRACE,omitempty"`
+	// Connect holds plugin configuration for CONNECT requests.
 	Connect *Plugins `bson:"CONNECT,omitempty" json:"CONNECT,omitempty"`
 }
 
@@ -649,7 +954,7 @@ type Plugins struct {
 	// Block request by allowance.
 	Block *Allowance `bson:"block,omitempty" json:"block,omitempty"`
 
-	// Ignore authentication on request by allowance.
+	// IgnoreAuthentication ignores authentication on request by allowance.
 	IgnoreAuthentication *Allowance `bson:"ignoreAuthentication,omitempty" json:"ignoreAuthentication,omitempty"`
 
 	// TransformRequestMethod allows you to transform the method of a request.
@@ -753,17 +1058,9 @@ func (a *Allowance) Import(enabled bool) {
 	a.Enabled = enabled
 }
 
-// Header holds a header name and value pair.
-type Header struct {
-	// Name is the name of the header.
-	Name string `bson:"name" json:"name"`
-	// Value is the value of the header.
-	Value string `bson:"value" json:"value"`
-}
-
 // TransformRequestMethod holds configuration for rewriting request methods.
 type TransformRequestMethod struct {
-	// Enabled enables Method Transform for the given path and method.
+	// Enabled activates Method Transform for the given path and method.
 	Enabled bool `bson:"enabled" json:"enabled"`
 	// ToMethod is the http method value to which the method of an incoming request will be transformed.
 	ToMethod string `bson:"toMethod" json:"toMethod"`
@@ -781,11 +1078,11 @@ func (tm *TransformRequestMethod) ExtractTo(meta *apidef.MethodTransformMeta) {
 	meta.ToMethod = tm.ToMethod
 }
 
-// TransformRequestBody holds configuration about body request transformations.
-type TransformRequestBody struct {
-	// Enabled enables transform request body middleware.
+// TransformBody holds configuration about request/response body transformations.
+type TransformBody struct {
+	// Enabled activates transform request/request body middleware.
 	Enabled bool `bson:"enabled" json:"enabled"`
-	// Format of the request body, xml or json.
+	// Format of the request/response body, xml or json.
 	Format apidef.RequestInputType `bson:"format" json:"format"`
 	// Path file path for the template.
 	Path string `bson:"path,omitempty" json:"path,omitempty"`
@@ -793,8 +1090,8 @@ type TransformRequestBody struct {
 	Body string `bson:"body,omitempty" json:"body,omitempty"`
 }
 
-// Fill fills *TransformRequestBody from apidef.TemplateMeta.
-func (tr *TransformRequestBody) Fill(meta apidef.TemplateMeta) {
+// Fill fills *TransformBody from apidef.TemplateMeta.
+func (tr *TransformBody) Fill(meta apidef.TemplateMeta) {
 	tr.Enabled = !meta.Disabled
 	tr.Format = meta.TemplateData.Input
 	if meta.TemplateData.Mode == apidef.UseBlob {
@@ -804,8 +1101,8 @@ func (tr *TransformRequestBody) Fill(meta apidef.TemplateMeta) {
 	}
 }
 
-// ExtractTo extracts data from *TransformRequestBody into *apidef.TemplateMeta.
-func (tr *TransformRequestBody) ExtractTo(meta *apidef.TemplateMeta) {
+// ExtractTo extracts data from *TransformBody into *apidef.TemplateMeta.
+func (tr *TransformBody) ExtractTo(meta *apidef.TemplateMeta) {
 	meta.Disabled = !tr.Enabled
 	meta.TemplateData.Input = tr.Format
 	meta.TemplateData.EnableSession = true
@@ -815,6 +1112,38 @@ func (tr *TransformRequestBody) ExtractTo(meta *apidef.TemplateMeta) {
 	} else {
 		meta.TemplateData.Mode = apidef.UseFile
 		meta.TemplateData.TemplateSource = tr.Path
+	}
+}
+
+// TransformHeaders holds configuration about request/response header transformations.
+type TransformHeaders struct {
+	// Enabled activates Header Transform for the given path and method.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Remove specifies header names to be removed from the request/response.
+	Remove []string `bson:"remove,omitempty" json:"remove,omitempty"`
+	// Add specifies headers to be added to the request/response.
+	Add Headers `bson:"add,omitempty" json:"add,omitempty"`
+}
+
+// Fill fills *TransformHeaders from apidef.HeaderInjectionMeta.
+func (th *TransformHeaders) Fill(meta apidef.HeaderInjectionMeta) {
+	th.Enabled = !meta.Disabled
+	th.Remove = meta.DeleteHeaders
+	th.Add = NewHeaders(meta.AddHeaders)
+
+	if len(th.Add) == 0 {
+		th.Add = nil
+	}
+}
+
+// ExtractTo extracts *TransformHeaders into *apidef.HeaderInjectionMeta.
+func (th *TransformHeaders) ExtractTo(meta *apidef.HeaderInjectionMeta) {
+	meta.Disabled = !th.Enabled
+	meta.DeleteHeaders = th.Remove
+
+	meta.AddHeaders = make(map[string]string, len(th.Remove))
+	for _, header := range th.Add {
+		meta.AddHeaders[header.Name] = header.Value
 	}
 }
 
@@ -830,6 +1159,9 @@ type CachePlugin struct {
 
 	// CacheResponseCodes contains a list of valid response codes for responses that are okay to add to the cache.
 	CacheResponseCodes []int `bson:"cacheResponseCodes,omitempty" json:"cacheResponseCodes,omitempty"`
+
+	// Timeout is the TTL for the endpoint level caching in seconds. 0 means no caching.
+	Timeout int64 `bson:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 // Fill fills *CachePlugin from apidef.CacheMeta.
@@ -837,6 +1169,7 @@ func (a *CachePlugin) Fill(cm apidef.CacheMeta) {
 	a.Enabled = !cm.Disabled
 	a.CacheByRegex = cm.CacheKeyRegex
 	a.CacheResponseCodes = cm.CacheOnlyResponseCodes
+	a.Timeout = cm.Timeout
 }
 
 // ExtractTo extracts *CachePlugin values to *apidef.CacheMeta.
@@ -844,6 +1177,7 @@ func (a *CachePlugin) ExtractTo(cm *apidef.CacheMeta) {
 	cm.Disabled = !a.Enabled
 	cm.CacheKeyRegex = a.CacheByRegex
 	cm.CacheOnlyResponseCodes = a.CacheResponseCodes
+	cm.Timeout = a.Timeout
 }
 
 // EnforceTimeout holds the configuration for enforcing request timeouts.
@@ -869,11 +1203,11 @@ func (et *EnforceTimeout) ExtractTo(meta *apidef.HardTimeoutMeta) {
 
 // CustomPlugin configures custom plugin.
 type CustomPlugin struct {
-	// Enabled enables the custom pre plugin.
+	// Enabled activates the custom pre plugin.
 	Enabled bool `bson:"enabled" json:"enabled"` // required.
 	// FunctionName is the name of authentication method.
 	FunctionName string `bson:"functionName" json:"functionName"` // required.
-	// Path is the path to shared object file in case of gopluign mode or path to js code in case of otto auth plugin.
+	// Path is the path to shared object file in case of goplugin mode or path to JS code in case of otto auth plugin.
 	Path string `bson:"path" json:"path"`
 	// RawBodyOnly if set to true, do not fill body in request or response object.
 	RawBodyOnly bool `bson:"rawBodyOnly,omitempty" json:"rawBodyOnly,omitempty"`
@@ -882,13 +1216,18 @@ type CustomPlugin struct {
 	RequireSession bool `bson:"requireSession,omitempty" json:"requireSession,omitempty"`
 }
 
-// CustomPlugins is a list of CustomPlugin.
+// CustomPlugins is a list of CustomPlugin objects.
 type CustomPlugins []CustomPlugin
 
 // Fill fills CustomPlugins from supplied Middleware definitions.
-func (c CustomPlugins) Fill(mwDefs []apidef.MiddlewareDefinition) {
+func (c *CustomPlugins) Fill(mwDefs []apidef.MiddlewareDefinition) {
+	if len(mwDefs) == 0 {
+		return
+	}
+
+	customPlugins := make(CustomPlugins, len(mwDefs))
 	for i, mwDef := range mwDefs {
-		c[i] = CustomPlugin{
+		customPlugins[i] = CustomPlugin{
 			Enabled:        !mwDef.Disabled,
 			Path:           mwDef.Path,
 			FunctionName:   mwDef.Name,
@@ -896,11 +1235,17 @@ func (c CustomPlugins) Fill(mwDefs []apidef.MiddlewareDefinition) {
 			RequireSession: mwDef.RequireSession,
 		}
 	}
+
+	*c = customPlugins
 }
 
 // ExtractTo extracts CustomPlugins into supplied Middleware definitions.
-func (c CustomPlugins) ExtractTo(mwDefs []apidef.MiddlewareDefinition) {
-	for i, plugin := range c {
+func (c *CustomPlugins) ExtractTo(mwDefs []apidef.MiddlewareDefinition) {
+	if c == nil {
+		return
+	}
+
+	for i, plugin := range *c {
 		mwDefs[i] = apidef.MiddlewareDefinition{
 			Disabled:       !plugin.Enabled,
 			Name:           plugin.FunctionName,
@@ -911,7 +1256,11 @@ func (c CustomPlugins) ExtractTo(mwDefs []apidef.MiddlewareDefinition) {
 	}
 }
 
-// PrePlugin configures pre stage plugins.
+// PrePlugin configures pre-request plugins.
+//
+// Pre-request plugins are executed before the request is sent to the
+// upstream target and before any authentication information is extracted
+// from the header or parameter list of the request.
 type PrePlugin struct {
 	// Plugins configures custom plugins to be run on pre authentication stage.
 	// The plugins would be executed in the order of configuration in the list.
@@ -1029,13 +1378,16 @@ func (p *ResponsePlugin) ExtractTo(api *apidef.APIDefinition) {
 
 // VirtualEndpoint contains virtual endpoint configuration.
 type VirtualEndpoint struct {
-	// Enabled enables virtual endpoint.
+	// Enabled activates virtual endpoint.
 	Enabled bool `bson:"enabled" json:"enabled"` // required.
-	// Name is the name of js function.
-	Name string `bson:"name" json:"name"` // required.
-	// Path is the path to js file.
+	// Name is the name of plugin function to be executed.
+	// Deprecated: Use FunctionName instead.
+	Name string `bson:"name,omitempty" json:"name,omitempty"`
+	// FunctionName is the name of plugin function to be executed.
+	FunctionName string `bson:"functionName" json:"functionName"` // required.
+	// Path is the path to JS file.
 	Path string `bson:"path,omitempty" json:"path,omitempty"`
-	// Body is the js function to execute encoded in base64 format.
+	// Body is the JS function to execute encoded in base64 format.
 	Body string `bson:"body,omitempty" json:"body,omitempty"`
 	// ProxyOnError proxies if virtual endpoint errors out.
 	ProxyOnError bool `bson:"proxyOnError,omitempty" json:"proxyOnError,omitempty"`
@@ -1043,10 +1395,32 @@ type VirtualEndpoint struct {
 	RequireSession bool `bson:"requireSession,omitempty" json:"requireSession,omitempty"`
 }
 
+// MarshalJSON is a custom JSON marshaler for the VirtualEndpoint struct. It is implemented
+// to facilitate a smooth migration from deprecated fields that were previously used to represent
+// the same data.
+func (v *VirtualEndpoint) MarshalJSON() ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	type Alias VirtualEndpoint
+
+	var payload = Alias(*v)
+
+	if payload.FunctionName == "" && payload.Name != "" {
+		payload.FunctionName = payload.Name
+		payload.Name = ""
+	}
+
+	// to prevent infinite recursion
+	return json.Marshal(payload)
+}
+
 // Fill fills *VirtualEndpoint from apidef.VirtualMeta.
 func (v *VirtualEndpoint) Fill(meta apidef.VirtualMeta) {
 	v.Enabled = !meta.Disabled
-	v.Name = meta.ResponseFunctionName
+	v.FunctionName = meta.ResponseFunctionName
+	v.Name = ""
 	v.RequireSession = meta.UseSession
 	v.ProxyOnError = meta.ProxyOnError
 	if meta.FunctionSourceType == apidef.UseBlob {
@@ -1059,7 +1433,13 @@ func (v *VirtualEndpoint) Fill(meta apidef.VirtualMeta) {
 // ExtractTo extracts *VirtualEndpoint to *apidef.VirtualMeta.
 func (v *VirtualEndpoint) ExtractTo(meta *apidef.VirtualMeta) {
 	meta.Disabled = !v.Enabled
-	meta.ResponseFunctionName = v.Name
+	if v.FunctionName != "" {
+		meta.ResponseFunctionName = v.FunctionName
+		v.Name = ""
+	} else {
+		meta.ResponseFunctionName = v.Name
+	}
+
 	meta.UseSession = v.RequireSession
 	meta.ProxyOnError = v.ProxyOnError
 	if v.Body != "" {
@@ -1071,16 +1451,40 @@ func (v *VirtualEndpoint) ExtractTo(meta *apidef.VirtualMeta) {
 	}
 }
 
+// EndpointPostPlugins is a list of EndpointPostPlugins. It's used where multiple plugins can be run.
 type EndpointPostPlugins []EndpointPostPlugin
 
 // EndpointPostPlugin contains endpoint level post plugin configuration.
 type EndpointPostPlugin struct {
-	// Enabled enables post plugin.
+	// Enabled activates post plugin.
 	Enabled bool `bson:"enabled" json:"enabled"` // required.
 	// Name is the name of plugin function to be executed.
-	Name string `bson:"name" json:"name"` // required.
+	// Deprecated: Use FunctionName instead.
+	Name string `bson:"name,omitempty" json:"name,omitempty"`
+	// FunctionName is the name of plugin function to be executed.
+	FunctionName string `bson:"functionName" json:"functionName"` // required.
 	// Path is the path to plugin.
 	Path string `bson:"path" json:"path"` // required.
+}
+
+// MarshalJSON is a custom JSON marshaler for the EndpointPostPlugin struct. It is implemented
+// to facilitate a smooth migration from deprecated fields that were previously used to represent
+// the same data.
+func (ep *EndpointPostPlugin) MarshalJSON() ([]byte, error) {
+	if ep == nil {
+		return nil, nil
+	}
+
+	// to prevent infinite recursion
+	type Alias EndpointPostPlugin
+
+	payload := Alias(*ep)
+	if payload.FunctionName == "" && payload.Name != "" {
+		payload.FunctionName = payload.Name
+		payload.Name = ""
+	}
+
+	return json.Marshal(payload)
 }
 
 // Fill fills *EndpointPostPlugin from apidef.GoPluginMeta.
@@ -1090,9 +1494,9 @@ func (e EndpointPostPlugins) Fill(meta apidef.GoPluginMeta) {
 	}
 
 	e[0] = EndpointPostPlugin{
-		Enabled: !meta.Disabled,
-		Name:    meta.SymbolName,
-		Path:    meta.PluginPath,
+		Enabled:      !meta.Disabled,
+		FunctionName: meta.SymbolName,
+		Path:         meta.PluginPath,
 	}
 }
 
@@ -1104,5 +1508,221 @@ func (e EndpointPostPlugins) ExtractTo(meta *apidef.GoPluginMeta) {
 
 	meta.Disabled = !e[0].Enabled
 	meta.PluginPath = e[0].Path
-	meta.SymbolName = e[0].Name
+	if e[0].FunctionName != "" {
+		meta.SymbolName = e[0].FunctionName
+	} else {
+		meta.SymbolName = e[0].Name
+	}
+}
+
+// CircuitBreaker holds configuration for the circuit breaker middleware.
+// Tyk classic API definition: `version_data.versions..extended_paths.circuit_breakers[*]`.
+type CircuitBreaker struct {
+	// Enabled activates the Circuit Breaker functionality.
+	// Tyk classic API definition: `version_data.versions..extended_paths.circuit_breakers[*].disabled`.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Threshold is the proportion from each `sampleSize` requests that must fail for the breaker to be tripped. This must be a value between 0.0 and 1.0. If `sampleSize` is 100 then a threshold of 0.4 means that the breaker will be tripped if 40 out of every 100 requests fails.
+	// Tyk classic API definition: `version_data.versions..extended_paths.circuit_breakers[*].threshold_percent`.
+	Threshold float64 `bson:"threshold" json:"threshold"`
+	// SampleSize is the size of the circuit breaker sampling window. Combining this with `threshold` gives the failure rate required to trip the circuit breaker.
+	// Tyk classic API definition: `version_data.versions..extended_paths.circuit_breakers[*].samples`.
+	SampleSize int `bson:"sampleSize" json:"sampleSize"`
+	// CoolDownPeriod is the period of time (in seconds) for which the circuit breaker will remain open before returning to service.
+	// Tyk classic API definition: `version_data.versions..extended_paths.circuit_breakers[*].return_to_service_after`.
+	CoolDownPeriod int `bson:"coolDownPeriod" json:"coolDownPeriod"`
+	// HalfOpenStateEnabled , if enabled, allows some requests to pass through the circuit breaker during the cool down period. If Tyk detects that the path is now working, the circuit breaker will be automatically reset and traffic will be resumed to the upstream.
+	// Tyk classic API definition: `version_data.versions..extended_paths.circuit_breakers[*].disable_half_open_state`.
+	HalfOpenStateEnabled bool `bson:"halfOpenStateEnabled" json:"halfOpenStateEnabled"`
+}
+
+// Fill fills *CircuitBreaker from apidef.CircuitBreakerMeta.
+func (cb *CircuitBreaker) Fill(circuitBreaker apidef.CircuitBreakerMeta) {
+	cb.Enabled = !circuitBreaker.Disabled
+	cb.Threshold = circuitBreaker.ThresholdPercent
+	cb.SampleSize = int(circuitBreaker.Samples)
+	cb.CoolDownPeriod = circuitBreaker.ReturnToServiceAfter
+	cb.HalfOpenStateEnabled = !circuitBreaker.DisableHalfOpenState
+}
+
+// ExtractTo extracts *CircuitBreaker into *apidef.CircuitBreakerMeta.
+func (cb *CircuitBreaker) ExtractTo(circuitBreaker *apidef.CircuitBreakerMeta) {
+	circuitBreaker.Disabled = !cb.Enabled
+	circuitBreaker.ThresholdPercent = cb.Threshold
+	circuitBreaker.Samples = int64(cb.SampleSize)
+	circuitBreaker.ReturnToServiceAfter = cb.CoolDownPeriod
+	circuitBreaker.DisableHalfOpenState = !cb.HalfOpenStateEnabled
+}
+
+// RequestSizeLimit limits the maximum allowed size of the request body in bytes.
+type RequestSizeLimit struct {
+	// Enabled activates the Request Size Limit functionality.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Value is the maximum allowed size of the request body in bytes.
+	Value int64 `bson:"value" json:"value"`
+}
+
+// Fill fills *RequestSizeLimit from apidef.RequestSizeMeta.
+func (r *RequestSizeLimit) Fill(meta apidef.RequestSizeMeta) {
+	r.Enabled = !meta.Disabled
+	r.Value = meta.SizeLimit
+}
+
+// ExtractTo extracts *RequestSizeLimiter into *apidef.RequestSizeMeta.
+func (r *RequestSizeLimit) ExtractTo(meta *apidef.RequestSizeMeta) {
+	meta.Disabled = !r.Enabled
+	meta.SizeLimit = r.Value
+}
+
+// TrafficLogs holds configuration about API log analytics.
+type TrafficLogs struct {
+	// Enabled enables traffic log analytics for the API.
+	// Tyk classic API definition: `do_not_track`.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// TagHeaders is a string array of HTTP headers that can be extracted
+	// and transformed into analytics tags (statistics aggregated by tag, per hour).
+	TagHeaders []string `bson:"tagHeaders" json:"tagHeaders,omitempty"`
+	// RetentionPeriod holds the configuration for the analytics retention, it contains configuration
+	// for how long you would like analytics data to last for.
+	RetentionPeriod *RetentionPeriod `bson:"retentionPeriod" json:"retentionPeriod,omitempty"`
+	// Plugins configures custom plugins to allow for extensive modifications to analytics records
+	// The plugins would be executed in the order of configuration in the list.
+	Plugins CustomPlugins `bson:"plugins,omitempty" json:"plugins,omitempty"`
+}
+
+// Fill fills *TrafficLogs from apidef.APIDefinition.
+func (t *TrafficLogs) Fill(api apidef.APIDefinition) {
+	t.Enabled = !api.DoNotTrack
+	t.TagHeaders = api.TagHeaders
+
+	if t.RetentionPeriod == nil {
+		t.RetentionPeriod = &RetentionPeriod{}
+	}
+	t.RetentionPeriod.Fill(api)
+	if ShouldOmit(t.RetentionPeriod) {
+		t.RetentionPeriod = nil
+	}
+
+	if len(api.CustomMiddleware.TrafficLogs) == 0 {
+		t.Plugins = nil
+	} else {
+		t.Plugins = make(CustomPlugins, len(api.CustomMiddleware.TrafficLogs))
+		t.Plugins.Fill(api.CustomMiddleware.TrafficLogs)
+	}
+}
+
+// ExtractTo extracts *TrafficLogs into *apidef.APIDefinition.
+func (t *TrafficLogs) ExtractTo(api *apidef.APIDefinition) {
+	api.DoNotTrack = !t.Enabled
+	api.TagHeaders = t.TagHeaders
+
+	if t.RetentionPeriod == nil {
+		t.RetentionPeriod = &RetentionPeriod{}
+		defer func() {
+			t.RetentionPeriod = nil
+		}()
+	}
+	t.RetentionPeriod.ExtractTo(api)
+
+	if len(t.Plugins) == 0 {
+		api.CustomMiddleware.TrafficLogs = nil
+	} else {
+		api.CustomMiddleware.TrafficLogs = make([]apidef.MiddlewareDefinition, len(t.Plugins))
+		t.Plugins.ExtractTo(api.CustomMiddleware.TrafficLogs)
+	}
+}
+
+// RetentionPeriod holds the configuration for analytics retention.
+type RetentionPeriod struct {
+	// Enabled enables log analytics retention for the API
+	//
+	// Tyk classic API definition: `!disable_expire_analytics`.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Value is the interval to keep the analytics record for
+	// The value of Value is a string that specifies the interval in a compact form,
+	// where hours, minutes and seconds are denoted by 'h', 'm' and 's' respectively.
+	// Multiple units can be combined to represent the duration.
+	//
+	// Examples of valid shorthand notations:
+	// - "1h"   : one hour
+	// - "20m"  : twenty minutes
+	// - "30s"  : thirty seconds
+	// - "1m29s": one minute and twenty-nine seconds
+	// - "1h30m" : one hour and thirty minutes
+	//
+	// An empty value is interpreted as "0s"
+	//
+	// Tyk classic API definition: `expire_analytics_after`.
+	Value ReadableDuration `bson:"value" json:"value"`
+}
+
+// Fill fills *RetentionPeriod from apidef.APIDefinition
+func (r *RetentionPeriod) Fill(api apidef.APIDefinition) {
+	r.Enabled = !api.DisableExpireAnalytics
+	r.Value = ReadableDuration(time.Duration(api.ExpireAnalyticsAfter) * time.Second)
+}
+
+// ExtractTo extracts *RetentionPeriod into apidef.APIDefinition
+func (r *RetentionPeriod) ExtractTo(api *apidef.APIDefinition) {
+	api.DisableExpireAnalytics = !r.Enabled
+	api.ExpireAnalyticsAfter = int64(r.Value.Seconds())
+}
+
+// GlobalRequestSizeLimit holds configuration about the global limits for request sizes.
+type GlobalRequestSizeLimit struct {
+	// Enabled activates the Request Size Limit.
+	// Tyk classic API definition: `version_data.versions..global_size_limit_disabled`.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Value contains the value of the request size limit.
+	// Tyk classic API definition: `version_data.versions..global_size_limit`.
+	Value int64 `bson:"value" json:"value"`
+}
+
+// Fill fills *GlobalRequestSizeLimit from apidef.APIDefinition.
+func (g *GlobalRequestSizeLimit) Fill(api apidef.APIDefinition) {
+	ok := false
+	if api.VersionData.Versions != nil {
+		_, ok = api.VersionData.Versions[Main]
+	}
+	if !ok || api.VersionData.Versions[Main].GlobalSizeLimit == 0 {
+		g.Enabled = false
+		g.Value = 0
+		return
+	}
+
+	g.Enabled = !api.VersionData.Versions[Main].GlobalSizeLimitDisabled
+	g.Value = api.VersionData.Versions[Main].GlobalSizeLimit
+}
+
+// ExtractTo extracts *GlobalRequestSizeLimit into *apidef.APIDefinition.
+func (g *GlobalRequestSizeLimit) ExtractTo(api *apidef.APIDefinition) {
+	mainVersion := requireMainVersion(api)
+	defer func() {
+		updateMainVersion(api, mainVersion)
+	}()
+
+	if g.Value == 0 {
+		mainVersion.GlobalSizeLimit = 0
+		mainVersion.GlobalSizeLimitDisabled = true
+		return
+	}
+
+	mainVersion.GlobalSizeLimitDisabled = !g.Enabled
+	mainVersion.GlobalSizeLimit = g.Value
+}
+
+// ContextVariables holds the configuration related to Tyk context variables.
+type ContextVariables struct {
+	// Enabled enables context variables to be passed to Tyk middlewares.
+	// Tyk classic API definition: `enable_context_vars`.
+	Enabled bool `json:"enabled" bson:"enabled"`
+}
+
+// Fill fills *ContextVariables from apidef.APIDefinition.
+func (c *ContextVariables) Fill(api apidef.APIDefinition) {
+	c.Enabled = api.EnableContextVars
+}
+
+// ExtractTo extracts *ContextVariables into *apidef.APIDefinition.
+func (c *ContextVariables) ExtractTo(api *apidef.APIDefinition) {
+	api.EnableContextVars = c.Enabled
 }
