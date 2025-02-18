@@ -2,7 +2,7 @@ package rpc
 
 import "testing"
 
-func TestRecoveryFromEmregencyMode(t *testing.T) {
+func TestRecoveryFromEmergencyMode(t *testing.T) {
 	if IsEmergencyMode() {
 		t.Fatal("expected not to be in emergency mode before initiating login attempt")
 	}
@@ -37,5 +37,41 @@ func TestRecoveryFromEmregencyMode(t *testing.T) {
 	}
 	if IsEmergencyMode() {
 		t.Fatal("expected to recover from emergency mode")
+	}
+}
+
+func TestClientIsConnected(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		connected bool
+		expected  bool
+	}{
+		{
+			name:      "When client is connected and not in emergency mode",
+			connected: true,
+			expected:  true,
+		},
+		{
+			name:      "When client is disconnected and not in emergency mode",
+			connected: false,
+			expected:  false,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			r := rpcOpts{}
+			r.clientIsConnected.Store(tt.connected)
+			defer func() {
+				r.clientIsConnected.Store(false)
+			}()
+
+			got := r.ClientIsConnected()
+			if got != tt.expected {
+				t.Errorf("ClientIsConnected() = %v, want %v", got, tt.expected)
+			}
+		})
 	}
 }

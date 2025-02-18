@@ -1,0 +1,82 @@
+---
+version: "3"
+
+vars:
+  root:
+    sh: git rev-parse --show-toplevel
+
+tasks:
+  run:
+    desc: "Run linters"
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: check
+      - golangci-lint run --new-from-rev=origin/master --issues-exit-code=1 --fix ./...
+
+  fmt:
+    desc: "Run typical code cleanup steps"
+    cmds:
+      - go fmt ./...
+      - go mod tidy
+
+  vet:
+    desc: "Run go vet"
+    dir: '{{.root}}'
+    cmds:
+      - go vet ./...
+
+  # this has manual use
+  golangci-lint:
+    desc: "Run golangci-lint for json summaries"
+    cmds:
+      - golangci-lint run --out-format json ./... | summary golangcilint > golangci-lint.json
+      - golangci-lint run --out-format json --config .golangci.dev.yml ./... | summary golangcilint > golangci-lint-dev.json
+
+  golangci-lint:fix:
+    desc: "Run golangci-lint w fixing"
+    cmds:
+      - golangci-lint run --config .golangci.dev.yml --fix ./...
+
+  golangci-lint:diff:
+    desc: "Print changes from dev -> CI"
+    cmds:
+      - dyff between -i .golangci.dev.yml .golangci.yml
+
+  build:
+    desc: "Run go build for sanity check"
+    dir: '{{.root}}'
+    cmds:
+      - go build .
+
+  build-test:
+    desc: "Compile go tests for sanity check"
+    dir: '{{.root}}'
+    cmds:
+      - cd gateway && go test -c .
+
+  check:
+    desc: "Run repository specific checks"
+    cmds:
+      - task: check:x-tyk-gateway
+      - task: check:imports
+      - task: check:config
+
+  check:imports:
+    desc: "go-fsck lint import paths"
+    dir: '{{.root}}'
+    cmds:
+      - go-fsck lint
+
+  check:config:
+    internal: true
+    desc: "lint config schema"
+    dir: '{{.root}}'
+    cmds:
+      - go test -count 1 ./cli/linter/...
+
+  check:x-tyk-gateway:
+    desc: "Lint x-tyk-gateway schema"
+    dir: '{{.root}}'
+    cmds:
+      - go test -count 1 -run=TestXTykGateway_Lint ./apidef/oas/

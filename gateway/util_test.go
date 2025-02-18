@@ -449,6 +449,44 @@ func Test_shouldReloadSpec(t *testing.T) {
 
 		assertionHelper(t, tcs)
 	})
+
+	t.Run("bundle", func(t *testing.T) {
+		t.Parallel()
+		tcs := []testCase{
+			{
+				name: "bundle disabled",
+				spec: &APISpec{
+					APIDefinition: &apidef.APIDefinition{
+						CustomMiddlewareBundleDisabled: true,
+						CustomMiddlewareBundle:         "bundle.zip",
+					},
+				},
+				want: false,
+			},
+			{
+				name: "bundle enabled with empty bundle value",
+				spec: &APISpec{
+					APIDefinition: &apidef.APIDefinition{
+						CustomMiddlewareBundleDisabled: false,
+						CustomMiddlewareBundle:         "",
+					},
+				},
+				want: false,
+			},
+			{
+				name: "bundle enabled with valid bundle value",
+				spec: &APISpec{
+					APIDefinition: &apidef.APIDefinition{
+						CustomMiddlewareBundleDisabled: false,
+						CustomMiddlewareBundle:         "bundle.zip",
+					},
+				},
+				want: true,
+			},
+		}
+
+		assertionHelper(t, tcs)
+	})
 }
 
 func TestAreMapsEqual(t *testing.T) {
@@ -483,6 +521,31 @@ func TestAreMapsEqual(t *testing.T) {
 			result := areMapsEqual(test.map1, test.map2)
 			if result != test.expected {
 				t.Errorf("areMapsEqual() = %v, want %v", result, test.expected)
+			}
+		})
+	}
+}
+
+func TestContainsEscapedCharacters(t *testing.T) {
+	tests := []struct {
+		value    string
+		expected bool
+	}{
+		{
+			value:    "payment%2Dintents",
+			expected: true,
+		},
+		{
+			value:    "payment-intents",
+			expected: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.value, func(t *testing.T) {
+			result := containsEscapedChars(test.value)
+			if result != test.expected {
+				t.Errorf("containsEscapedChars() = %v, want %v", result, test.expected)
 			}
 		})
 	}

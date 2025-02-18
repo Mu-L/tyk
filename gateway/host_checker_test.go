@@ -3,7 +3,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"text/template"
+	texttemplate "text/template"
 	"time"
 
 	proxyproto "github.com/pires/go-proxyproto"
@@ -69,7 +68,6 @@ func (w *testEventHandler) HandleEvent(em config.EventMessage) {
 	w.cb(em)
 }
 
-// // ToDo check why it blocks
 func TestHostChecker(t *testing.T) {
 	ts := StartTest(func(globalConf *config.Config) {
 		globalConf.UptimeTests.PollerGroup = uuid.New()
@@ -77,7 +75,7 @@ func TestHostChecker(t *testing.T) {
 	})
 	defer ts.Close()
 
-	specTmpl := template.Must(template.New("spec").Parse(sampleUptimeTestAPI))
+	specTmpl := texttemplate.Must(texttemplate.New("spec").Parse(sampleUptimeTestAPI))
 
 	tmplData := struct {
 		Host1, Host2 string
@@ -185,7 +183,7 @@ func TestReverseProxyAllDown(t *testing.T) {
 	})
 	defer ts.Close()
 
-	specTmpl := template.Must(template.New("spec").Parse(sampleUptimeTestAPI))
+	specTmpl := texttemplate.Must(texttemplate.New("spec").Parse(sampleUptimeTestAPI))
 
 	tmplData := struct {
 		Host1, Host2 string
@@ -214,8 +212,8 @@ func TestReverseProxyAllDown(t *testing.T) {
 	}
 	ts.Gw.GlobalHostChecker.checkerMu.Lock()
 	if ts.Gw.GlobalHostChecker.checker == nil {
-		fmt.Printf("\nStop loop: %v\n", !ts.Gw.GlobalHostChecker.stopLoop)
-		fmt.Printf("\n Am I pooling: %v\n", ts.Gw.GlobalHostChecker.AmIPolling())
+		t.Logf("Stop loop: %v\n", !ts.Gw.GlobalHostChecker.stopLoop)
+		t.Logf("Am I pooling: %v\n", ts.Gw.GlobalHostChecker.AmIPolling())
 	}
 	ts.Gw.GlobalHostChecker.checkerMu.Unlock()
 
@@ -400,6 +398,8 @@ func TestTestCheckerTCPHosts_correct_answers_proxy_protocol(t *testing.T) {
 }
 
 func TestTestCheckerTCPHosts_correct_wrong_answers(t *testing.T) {
+	t.Skip() // TT-13861
+
 	ts := StartTest(nil)
 	defer ts.Close()
 

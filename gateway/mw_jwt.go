@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/lonelycode/osin"
-	"github.com/square/go-jose"
 
 	"github.com/TykTechnologies/tyk/apidef"
 	"github.com/TykTechnologies/tyk/storage"
@@ -27,7 +27,7 @@ import (
 )
 
 type JWTMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
 }
 
 const (
@@ -202,12 +202,7 @@ func (k *JWTMiddleware) getSecretToVerifySignature(r *http.Request, token *jwt.T
 
 		// Is decoded url too?
 		if httpScheme.MatchString(string(decodedCert)) {
-			secret, err := k.getSecretFromURL(string(decodedCert), token.Header[KID], k.Spec.JWTSigningMethod)
-			if err != nil {
-				return nil, err
-			}
-
-			return secret, nil
+			return k.getSecretFromURL(string(decodedCert), token.Header[KID], k.Spec.JWTSigningMethod)
 		}
 
 		return decodedCert, nil // Returns the decoded secret
@@ -567,21 +562,33 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 		}
 	}
 
+	oauthClientID := ""
 	// Get the OAuth client ID if available:
-	oauthClientID := k.getOAuthClientIDFromClaim(claims)
-	session.OauthClientID = oauthClientID
-	if session.OauthClientID != "" {
+	if !k.Spec.IDPClientIDMappingDisabled {
+		oauthClientID = k.getOAuthClientIDFromClaim(claims)
+	}
+
+	if session.OauthClientID != oauthClientID {
+		session.OauthClientID = oauthClientID
+		updateSession = true
+	}
+
+	if !k.Spec.IDPClientIDMappingDisabled && oauthClientID != "" {
 		// Initialize the OAuthManager if empty:
 		if k.Spec.OAuthManager == nil {
 			prefix := generateOAuthPrefix(k.Spec.APIID)
 			storageManager := k.Gw.getGlobalMDCBStorageHandler(prefix, false)
 			storageManager.Connect()
+
+			storageDriver := &storage.RedisCluster{KeyPrefix: prefix, HashKeys: false, ConnectionHandler: k.Gw.StorageConnectionHandler}
+			storageDriver.Connect()
+
 			k.Spec.OAuthManager = &OAuthManager{
 				OsinServer: k.Gw.TykOsinNewServer(&osin.ServerConfig{},
 					&RedisOsinStorageInterface{
 						storageManager,
 						k.Gw.GlobalSessionManager,
-						&storage.RedisCluster{KeyPrefix: prefix, HashKeys: false, RedisController: k.Gw.RedisController},
+						storageDriver,
 						k.Spec.OrgID,
 						k.Gw,
 					}),
@@ -589,15 +596,16 @@ func (k *JWTMiddleware) processCentralisedJWT(r *http.Request, token *jwt.Token)
 		}
 
 		// Retrieve OAuth client data from storage and inject developer ID into the session object:
-		client, err := k.Spec.OAuthManager.OsinServer.Storage.GetClient(oauthClientID)
+		client, err := k.Spec.OAuthManager.Storage().GetClient(oauthClientID)
 		if err == nil {
 			userData := client.GetUserData()
 			if userData != nil {
 				data, ok := userData.(map[string]interface{})
 				if ok {
-					developerID, keyFound := data["tyk_developer_id"].(string)
-					if keyFound {
-						session.MetaData["tyk_developer_id"] = developerID
+					updateSession = session.TagsFromMetadata(data)
+
+					if err := k.ApplyPolicies(&session); err != nil {
+						return errors.New("failed to apply policies in session metadata: " + err.Error()), http.StatusInternalServerError
 					}
 				}
 			}
@@ -834,9 +842,12 @@ func assertSigningMethod(signingMethod string, token *jwt.Token) error {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return fmt.Errorf("%v: %v and not HMAC signature", UnexpectedSigningMethod, token.Header["alg"])
 		}
+	// Supports both RSA + RSAPSS Signing.
 	case RSASign:
 		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-			return fmt.Errorf("%v: %v and not RSA signature", UnexpectedSigningMethod, token.Header["alg"])
+			if _, ok := token.Method.(*jwt.SigningMethodRSAPSS); !ok {
+				return fmt.Errorf("%v: %v and not RSA or RSAPSS signature", UnexpectedSigningMethod, token.Header["alg"])
+			}
 		}
 	case ECDSASign:
 		if _, ok := token.Method.(*jwt.SigningMethodECDSA); !ok {

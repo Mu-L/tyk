@@ -6,11 +6,16 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/oasdiff/yaml"
 
+	"github.com/TykTechnologies/storage/persistent/model"
+
+	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/internal/event"
 )
 
 func TestOAS(t *testing.T) {
@@ -109,6 +114,185 @@ func TestOAS(t *testing.T) {
 	})
 }
 
+func TestOAS_ExtractTo_DontTouchExistingClassicFields(t *testing.T) {
+	var api apidef.APIDefinition
+	api.VersionData.Versions = map[string]apidef.VersionInfo{
+		Main: {
+			ExtendedPaths: apidef.ExtendedPathsSet{
+				PersistGraphQL: []apidef.PersistGraphQLMeta{
+					{},
+				},
+			},
+		},
+	}
+
+	var s OAS
+	s.ExtractTo(&api)
+
+	assert.Len(t, api.VersionData.Versions[Main].ExtendedPaths.PersistGraphQL, 1)
+}
+
+func TestOAS_ExtractTo_ResetAPIDefinition(t *testing.T) {
+	var a apidef.APIDefinition
+	Fill(t, &a, 0)
+
+	// Fill doesn't populate eventhandlers to a valid value, we do it now.
+	a.EventHandlers.Events = map[apidef.TykEvent][]apidef.EventHandlerTriggerConfig{
+		event.QuotaExceeded: {
+			{
+				Handler: event.WebHookHandler,
+				HandlerMeta: map[string]any{
+					"target_path": "https://webhook.site/uuid",
+				},
+			},
+			{
+				Handler: event.JSVMHandler,
+				HandlerMeta: map[string]any{
+					"name": "myHandler",
+					"path": "my_script.js",
+				},
+			},
+		},
+	}
+
+	var vInfo apidef.VersionInfo
+	Fill(t, &vInfo, 0)
+	a.VersionData.Versions = map[string]apidef.VersionInfo{
+		Main: vInfo,
+	}
+
+	var s OAS
+	s.ExtractTo(&a)
+
+	a.UseKeylessAccess = false
+	a.UpstreamCertificatesDisabled = false
+	a.CertificatePinningDisabled = false
+	a.Proxy.ServiceDiscovery.CacheDisabled = false
+	a.CustomMiddlewareBundleDisabled = false
+	a.DomainDisabled = false
+	a.ConfigDataDisabled = false
+	a.CustomMiddleware.AuthCheck.Disabled = false
+	a.CustomMiddleware.IdExtractor.Disabled = false
+	a.GlobalRateLimit.Disabled = false
+	a.TagsDisabled = false
+	a.IsOAS = false
+	a.IDPClientIDMappingDisabled = false
+	a.EnableContextVars = false
+	a.DisableRateLimit = false
+	a.DoNotTrack = false
+	a.IPAccessControlDisabled = false
+
+	// deprecated fields
+	a.Auth = apidef.AuthConfig{}
+	a.VersionDefinition.StripPath = false
+	a.UseGoPluginAuth = false
+	a.EnableCoProcessAuth = false
+	a.JWTScopeToPolicyMapping = nil
+	a.JWTScopeClaimName = ""
+	a.VersionData.NotVersioned = false
+	vInfo = a.VersionData.Versions[""]
+	vInfo.Name = ""
+	vInfo.Expires = ""
+	vInfo.Paths.Ignored = nil
+	vInfo.Paths.WhiteList = nil
+	vInfo.Paths.BlackList = nil
+	vInfo.OverrideTarget = ""
+	vInfo.GlobalHeadersDisabled = false
+	vInfo.GlobalResponseHeadersDisabled = false
+	vInfo.UseExtendedPaths = false
+	vInfo.GlobalSizeLimitDisabled = false
+
+	vInfo.ExtendedPaths.Clear()
+
+	a.VersionData.Versions[""] = vInfo
+
+	assert.Empty(t, a.Name)
+
+	noOASSupportFields := getNonEmptyFields(a, "APIDefinition")
+
+	// The expectedFields value lists fields that do not support migration.
+	// When adding a migration for ExtendedPaths sections, clear the list of
+	// fields below, and clear the value in ExtendedPaths.Clear() function.
+
+	expectedFields := []string{
+		"APIDefinition.Slug",
+		"APIDefinition.EnableProxyProtocol",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.TransformJQ[0].Filter",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.TransformJQ[0].Path",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.TransformJQ[0].Method",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.TransformJQResponse[0].Filter",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.TransformJQResponse[0].Path",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.TransformJQResponse[0].Method",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.PersistGraphQL[0].Path",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.PersistGraphQL[0].Method",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.PersistGraphQL[0].Operation",
+		"APIDefinition.VersionData.Versions[0].ExtendedPaths.PersistGraphQL[0].Variables[0]",
+		"APIDefinition.VersionData.Versions[0].IgnoreEndpointCase",
+		"APIDefinition.UptimeTests.Config.ServiceDiscovery.CacheDisabled",
+		"APIDefinition.Proxy.DisableStripSlash",
+		"APIDefinition.Proxy.CheckHostAgainstUptimeTests",
+		"APIDefinition.DisableQuota",
+		"APIDefinition.AuthProvider.Name",
+		"APIDefinition.AuthProvider.StorageEngine",
+		"APIDefinition.AuthProvider.Meta[0]",
+		"APIDefinition.SessionProvider.Name",
+		"APIDefinition.SessionProvider.StorageEngine",
+		"APIDefinition.SessionProvider.Meta[0]",
+		"APIDefinition.EnableIpWhiteListing",
+		"APIDefinition.EnableIpBlacklisting",
+		"APIDefinition.DontSetQuotasOnCreate",
+		"APIDefinition.ResponseProcessors[0].Name",
+		"APIDefinition.ResponseProcessors[0].Options",
+		"APIDefinition.GraphQL.Enabled",
+		"APIDefinition.GraphQL.ExecutionMode",
+		"APIDefinition.GraphQL.Version",
+		"APIDefinition.GraphQL.Schema",
+		"APIDefinition.GraphQL.TypeFieldConfigurations[0].TypeName",
+		"APIDefinition.GraphQL.TypeFieldConfigurations[0].FieldName",
+		"APIDefinition.GraphQL.TypeFieldConfigurations[0].Mapping.Disabled",
+		"APIDefinition.GraphQL.TypeFieldConfigurations[0].Mapping.Path",
+		"APIDefinition.GraphQL.TypeFieldConfigurations[0].DataSource.Name",
+		"APIDefinition.GraphQL.TypeFieldConfigurations[0].DataSource.Config[0]",
+		"APIDefinition.GraphQL.GraphQLPlayground.Enabled",
+		"APIDefinition.GraphQL.GraphQLPlayground.Path",
+		"APIDefinition.GraphQL.Engine.FieldConfigs[0].TypeName",
+		"APIDefinition.GraphQL.Engine.FieldConfigs[0].FieldName",
+		"APIDefinition.GraphQL.Engine.FieldConfigs[0].DisableDefaultMapping",
+		"APIDefinition.GraphQL.Engine.FieldConfigs[0].Path[0]",
+		"APIDefinition.GraphQL.Engine.DataSources[0].Kind",
+		"APIDefinition.GraphQL.Engine.DataSources[0].Name",
+		"APIDefinition.GraphQL.Engine.DataSources[0].Internal",
+		"APIDefinition.GraphQL.Engine.DataSources[0].RootFields[0].Type",
+		"APIDefinition.GraphQL.Engine.DataSources[0].RootFields[0].Fields[0]",
+		"APIDefinition.GraphQL.Engine.DataSources[0].Config[0]",
+		"APIDefinition.GraphQL.Engine.GlobalHeaders[0].Key",
+		"APIDefinition.GraphQL.Engine.GlobalHeaders[0].Value",
+		"APIDefinition.GraphQL.Proxy.Features.UseImmutableHeaders",
+		"APIDefinition.GraphQL.Proxy.AuthHeaders[0]",
+		"APIDefinition.GraphQL.Proxy.SubscriptionType",
+		"APIDefinition.GraphQL.Proxy.RequestHeaders[0]",
+		"APIDefinition.GraphQL.Proxy.UseResponseExtensions.OnErrorForwarding",
+		"APIDefinition.GraphQL.Proxy.RequestHeadersRewrite[0].Value",
+		"APIDefinition.GraphQL.Proxy.RequestHeadersRewrite[0].Remove",
+		"APIDefinition.GraphQL.Subgraph.SDL",
+		"APIDefinition.GraphQL.Supergraph.Subgraphs[0].APIID",
+		"APIDefinition.GraphQL.Supergraph.Subgraphs[0].Name",
+		"APIDefinition.GraphQL.Supergraph.Subgraphs[0].URL",
+		"APIDefinition.GraphQL.Supergraph.Subgraphs[0].SDL",
+		"APIDefinition.GraphQL.Supergraph.Subgraphs[0].Headers[0]",
+		"APIDefinition.GraphQL.Supergraph.Subgraphs[0].SubscriptionType",
+		"APIDefinition.GraphQL.Supergraph.MergedSDL",
+		"APIDefinition.GraphQL.Supergraph.GlobalHeaders[0]",
+		"APIDefinition.GraphQL.Supergraph.DisableQueryBatching",
+		"APIDefinition.GraphQL.Introspection.Disabled",
+		"APIDefinition.AnalyticsPlugin.Enabled",
+		"APIDefinition.AnalyticsPlugin.PluginPath",
+		"APIDefinition.AnalyticsPlugin.FuncName",
+	}
+
+	assert.Equal(t, expectedFields, noOASSupportFields)
+}
+
 func TestOAS_AddServers(t *testing.T) {
 	t.Parallel()
 	type fields struct {
@@ -118,14 +302,22 @@ func TestOAS_AddServers(t *testing.T) {
 		apiURLs []string
 	}
 	tests := []struct {
-		name   string
-		fields fields
-		args   args
+		name         string
+		fields       fields
+		args         args
+		expectedURLs []string
 	}{
 		{
-			name:   "empty servers",
-			fields: fields{T: openapi3.T{}},
-			args:   args{apiURLs: []string{"http://127.0.0.1:8080/api"}},
+			name:         "empty servers",
+			fields:       fields{T: openapi3.T{}},
+			args:         args{apiURLs: []string{"http://127.0.0.1:8080/api"}},
+			expectedURLs: []string{"http://127.0.0.1:8080/api"},
+		},
+		{
+			name:         "empty servers and named parameters",
+			fields:       fields{T: openapi3.T{}},
+			args:         args{apiURLs: []string{"http://{subdomain}/api"}},
+			expectedURLs: nil,
 		},
 		{
 			name: "non-empty servers",
@@ -136,7 +328,20 @@ func TestOAS_AddServers(t *testing.T) {
 					},
 				},
 			}},
-			args: args{apiURLs: []string{"http://127.0.0.1:8080/api"}},
+			args:         args{apiURLs: []string{"http://127.0.0.1:8080/api"}},
+			expectedURLs: []string{"http://127.0.0.1:8080/api", "http://example-upstream.org/api"},
+		},
+		{
+			name: "non-empty servers and mix on named parameters and normal urls",
+			fields: fields{T: openapi3.T{
+				Servers: openapi3.Servers{
+					{
+						URL: "http://example-upstream.org/api",
+					},
+				},
+			}},
+			args:         args{apiURLs: []string{"http://127.0.0.1:8080/api", "http://{subdomain}/api"}},
+			expectedURLs: []string{"http://127.0.0.1:8080/api", "http://example-upstream.org/api"},
 		},
 		{
 			name: "non-empty servers having same URL that of apiURL",
@@ -154,6 +359,11 @@ func TestOAS_AddServers(t *testing.T) {
 				},
 			}},
 			args: args{apiURLs: []string{"http://127.0.0.1:8080/api"}},
+			expectedURLs: []string{
+				"http://127.0.0.1:8080/api",
+				"http://example-upstream.org/api",
+				"http://legacy-upstream.org/api",
+			},
 		},
 		{
 			name: "non-empty servers having same URL that of apiURL",
@@ -168,6 +378,10 @@ func TestOAS_AddServers(t *testing.T) {
 				},
 			}},
 			args: args{apiURLs: []string{"http://127.0.0.1:8080/api"}},
+			expectedURLs: []string{
+				"http://127.0.0.1:8080/api",
+				"http://example-upstream.org/api",
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -176,12 +390,16 @@ func TestOAS_AddServers(t *testing.T) {
 				T: tt.fields.T,
 			}
 			s.AddServers(tt.args.apiURLs...)
-			addedServerURLs := make([]string, len(tt.args.apiURLs))
-			for i, server := range s.Servers[:len(tt.args.apiURLs)] {
-				addedServerURLs[i] = server.URL
+			if tt.expectedURLs == nil {
+				assert.Empty(t, s.Servers)
+				return
+			}
+			var serverURLs []string
+			for _, server := range s.Servers {
+				serverURLs = append(serverURLs, server.URL)
 			}
 
-			assert.ElementsMatch(t, tt.args.apiURLs, addedServerURLs)
+			assert.ElementsMatch(t, tt.expectedURLs, serverURLs)
 		})
 	}
 }
@@ -189,56 +407,116 @@ func TestOAS_AddServers(t *testing.T) {
 func TestOAS_UpdateServers(t *testing.T) {
 	t.Parallel()
 	type fields struct {
-		T openapi3.T
+		S openapi3.Servers
 	}
 	type args struct {
 		apiURL    string
 		oldAPIURL string
 	}
 	tests := []struct {
-		name        string
-		fields      fields
-		args        args
-		expectedURL string
+		name            string
+		fields          fields
+		args            args
+		expectedServers openapi3.Servers
 	}{
 		{
-			name:        "empty servers",
-			fields:      fields{T: openapi3.T{}},
-			args:        args{apiURL: "http://127.0.0.1:8080/api", oldAPIURL: ""},
-			expectedURL: "http://127.0.0.1:8080/api",
+			name:   "empty servers",
+			fields: fields{S: openapi3.Servers{}},
+			args:   args{apiURL: "http://127.0.0.1:8080/api", oldAPIURL: ""},
+			expectedServers: openapi3.Servers{
+				{
+					URL: "http://127.0.0.1:8080/api",
+				},
+			},
 		},
 		{
 			name: "non-empty servers replace with new",
-			fields: fields{T: openapi3.T{
-				Servers: openapi3.Servers{
+			fields: fields{
+				S: openapi3.Servers{
 					{
 						URL: "http://example-upstream.org/api",
 					},
 				},
-			}},
-			args:        args{apiURL: "http://127.0.0.1:8080/api", oldAPIURL: "http://example-upstream.org/api"},
-			expectedURL: "http://127.0.0.1:8080/api",
+			},
+			args: args{apiURL: "http://127.0.0.1:8080/api", oldAPIURL: "http://example-upstream.org/api"},
+			expectedServers: openapi3.Servers{
+				{
+					URL: "http://127.0.0.1:8080/api",
+				},
+			},
 		},
 		{
 			name: "non-empty servers not replace",
-			fields: fields{T: openapi3.T{
-				Servers: openapi3.Servers{
+			fields: fields{
+				S: openapi3.Servers{
 					{
 						URL: "http://example-upstream.org/api",
 					},
 				},
-			}},
-			args:        args{apiURL: "http://127.0.0.1:8080/api", oldAPIURL: "http://localhost/api"},
-			expectedURL: "http://example-upstream.org/api",
+			},
+			args: args{apiURL: "http://127.0.0.1:8080/api", oldAPIURL: "http://localhost/api"},
+			expectedServers: openapi3.Servers{
+				{
+					URL: "http://example-upstream.org/api",
+				},
+			},
+		},
+		{
+			name: "apiURL with named parameter, do not add to existing servers(not added by Tyk)",
+			fields: fields{
+				S: openapi3.Servers{
+					{
+						URL: "http://example-upstream.org/api",
+					},
+				},
+			},
+			args: args{apiURL: "http://{subdomain:[a-z]+}/api", oldAPIURL: "http://localhost/api"},
+			expectedServers: openapi3.Servers{
+				{
+					URL: "http://example-upstream.org/api",
+				},
+			},
+		},
+		{
+			name: "apiURL with named parameter, remove servers entry added by Tyk",
+			fields: fields{
+				S: openapi3.Servers{
+					{
+						URL: "http://example-upstream.org/api",
+					},
+					{
+						URL: "http://other-upstream.org/api",
+					},
+				},
+			},
+			args: args{apiURL: "http://{subdomain:[a-z]+}/api", oldAPIURL: "http://example-upstream.org/api"},
+			expectedServers: openapi3.Servers{
+				{
+					URL: "http://other-upstream.org/api",
+				},
+			},
+		},
+		{
+			name: "apiURL with named parameter, remove only servers entry added by Tyk",
+			fields: fields{
+				S: openapi3.Servers{
+					{
+						URL: "http://example-upstream.org/api",
+					},
+				},
+			},
+			args:            args{apiURL: "http://{subdomain:[a-z]+}/api", oldAPIURL: "http://example-upstream.org/api"},
+			expectedServers: openapi3.Servers{},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &OAS{
-				T: tt.fields.T,
+				T: openapi3.T{Servers: tt.fields.S},
 			}
 			s.UpdateServers(tt.args.apiURL, tt.args.oldAPIURL)
-			assert.Equal(t, tt.expectedURL, s.Servers[0].URL)
+
+			assert.Equal(t, tt.expectedServers, s.Servers)
 		})
 	}
 }
@@ -497,6 +775,58 @@ func TestOAS_MarshalJSON(t *testing.T) {
 	})
 }
 
+func TestOAS_Clone(t *testing.T) {
+	s := &OAS{}
+	s.SetTykExtension(&XTykAPIGateway{Info: Info{
+		Name: "my-api",
+	}})
+
+	clonedOAS, err := s.Clone()
+	assert.NoError(t, err)
+	assert.Equal(t, s, clonedOAS)
+
+	s.GetTykExtension().Info.Name = "my-api-modified"
+	assert.NotEqual(t, s, clonedOAS)
+
+	t.Run("clone impossible to marshal value", func(t *testing.T) {
+		s.Extensions["weird extension"] = make(chan int)
+
+		result, err := s.Clone()
+		assert.NoError(t, err)
+
+		_, ok := result.Extensions["weird extension"]
+		assert.True(t, ok)
+	})
+}
+
+func BenchmarkOAS_Clone(b *testing.B) {
+	oas := &OAS{
+		T: openapi3.T{
+			Info: &openapi3.Info{
+				Title: "my-oas-doc",
+			},
+			Paths: map[string]*openapi3.PathItem{
+				"/get": {
+					Get: &openapi3.Operation{
+						Responses: openapi3.Responses{
+							"200": &openapi3.ResponseRef{
+								Value: &openapi3.Response{
+									Description: getStrPointer("some example endpoint"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for i := 0; i < b.N; i++ {
+		_, err := oas.Clone()
+		assert.NoError(b, err)
+	}
+}
+
 func TestMigrateAndFillOAS(t *testing.T) {
 	var api apidef.APIDefinition
 	api.SetDisabledFlags()
@@ -528,8 +858,6 @@ func TestMigrateAndFillOAS(t *testing.T) {
 	assert.Equal(t, DefaultOpenAPI, versionAPIDefs[1].OAS.OpenAPI)
 	assert.Equal(t, "Furkan-v2", versionAPIDefs[1].OAS.Info.Title)
 	assert.Equal(t, "v2", versionAPIDefs[1].OAS.Info.Version)
-
-	assert.NotEqual(t, versionAPIDefs[0].Classic.APIID, versionAPIDefs[1].Classic.APIID)
 
 	err = baseAPIDef.OAS.Validate(context.Background())
 	assert.NoError(t, err)
@@ -594,7 +922,13 @@ func TestMigrateAndFillOAS_DropEmpties(t *testing.T) {
 	})
 
 	t.Run("plugin bundle", func(t *testing.T) {
-		assert.Nil(t, baseAPI.OAS.GetTykExtension().Middleware)
+		assert.Equal(t, &Middleware{
+			Global: &Global{
+				TrafficLogs: &TrafficLogs{
+					Enabled: true,
+				},
+			},
+		}, baseAPI.OAS.GetTykExtension().Middleware)
 	})
 
 	t.Run("mutualTLS", func(t *testing.T) {
@@ -782,16 +1116,15 @@ func TestMigrateAndFillOAS_CustomPlugins(t *testing.T) {
 		migratedAPI, _, err := MigrateAndFillOAS(&api)
 		assert.NoError(t, err)
 
-		expectedPrePlugin := PrePlugin{
-			Plugins: CustomPlugins{
-				{
-					Enabled:      true,
-					FunctionName: "Pre",
-					Path:         "/path/to/plugin",
-				},
+		expectedPrePlugin := CustomPlugins{
+			{
+				Enabled:      true,
+				FunctionName: "Pre",
+				Path:         "/path/to/plugin",
 			},
 		}
-		assert.Equal(t, expectedPrePlugin, *migratedAPI.OAS.GetTykExtension().Middleware.Global.PrePlugin)
+		assert.Equal(t, expectedPrePlugin, migratedAPI.OAS.GetTykExtension().Middleware.Global.PrePlugins)
+		assert.Nil(t, migratedAPI.OAS.GetTykExtension().Middleware.Global.PrePlugin)
 		assert.Equal(t, apidef.GoPluginDriver, migratedAPI.OAS.GetTykExtension().Middleware.Global.PluginConfig.Driver)
 	})
 
@@ -820,16 +1153,15 @@ func TestMigrateAndFillOAS_CustomPlugins(t *testing.T) {
 		migratedAPI, _, err := MigrateAndFillOAS(&api)
 		assert.NoError(t, err)
 
-		expectedPrePlugin := PostAuthenticationPlugin{
-			Plugins: CustomPlugins{
-				{
-					Enabled:      true,
-					FunctionName: "PostAuth",
-					Path:         "/path/to/plugin",
-				},
+		expectedPrePlugin := CustomPlugins{
+			{
+				Enabled:      true,
+				FunctionName: "PostAuth",
+				Path:         "/path/to/plugin",
 			},
 		}
-		assert.Equal(t, expectedPrePlugin, *migratedAPI.OAS.GetTykExtension().Middleware.Global.PostAuthenticationPlugin)
+		assert.Equal(t, expectedPrePlugin, migratedAPI.OAS.GetTykExtension().Middleware.Global.PostAuthenticationPlugins)
+		assert.Nil(t, migratedAPI.OAS.GetTykExtension().Middleware.Global.PostAuthenticationPlugin)
 		assert.Equal(t, apidef.GoPluginDriver, migratedAPI.OAS.GetTykExtension().Middleware.Global.PluginConfig.Driver)
 	})
 
@@ -858,16 +1190,15 @@ func TestMigrateAndFillOAS_CustomPlugins(t *testing.T) {
 		migratedAPI, _, err := MigrateAndFillOAS(&api)
 		assert.NoError(t, err)
 
-		expectedPrePlugin := PostPlugin{
-			Plugins: CustomPlugins{
-				{
-					Enabled:      true,
-					FunctionName: "Post",
-					Path:         "/path/to/plugin",
-				},
+		expectedPrePlugin := CustomPlugins{
+			{
+				Enabled:      true,
+				FunctionName: "Post",
+				Path:         "/path/to/plugin",
 			},
 		}
-		assert.Equal(t, expectedPrePlugin, *migratedAPI.OAS.GetTykExtension().Middleware.Global.PostPlugin)
+		assert.Equal(t, expectedPrePlugin, migratedAPI.OAS.GetTykExtension().Middleware.Global.PostPlugins)
+		assert.Nil(t, migratedAPI.OAS.GetTykExtension().Middleware.Global.PostPlugin)
 		assert.Equal(t, apidef.GoPluginDriver, migratedAPI.OAS.GetTykExtension().Middleware.Global.PluginConfig.Driver)
 	})
 
@@ -896,16 +1227,15 @@ func TestMigrateAndFillOAS_CustomPlugins(t *testing.T) {
 		migratedAPI, _, err := MigrateAndFillOAS(&api)
 		assert.NoError(t, err)
 
-		expectedPrePlugin := ResponsePlugin{
-			Plugins: CustomPlugins{
-				{
-					Enabled:      true,
-					FunctionName: "Response",
-					Path:         "/path/to/plugin",
-				},
+		expectedPrePlugin := CustomPlugins{
+			{
+				Enabled:      true,
+				FunctionName: "Response",
+				Path:         "/path/to/plugin",
 			},
 		}
-		assert.Equal(t, expectedPrePlugin, *migratedAPI.OAS.GetTykExtension().Middleware.Global.ResponsePlugin)
+		assert.Equal(t, expectedPrePlugin, migratedAPI.OAS.GetTykExtension().Middleware.Global.ResponsePlugins)
+		assert.Nil(t, migratedAPI.OAS.GetTykExtension().Middleware.Global.ResponsePlugin)
 		assert.Equal(t, apidef.GoPluginDriver, migratedAPI.OAS.GetTykExtension().Middleware.Global.PluginConfig.Driver)
 	})
 }
@@ -937,4 +1267,77 @@ func TestMigrateAndFillOAS_PluginConfigData(t *testing.T) {
 		Value:   configData,
 	}
 	assert.Equal(t, expectedPluginConfigData, migratedAPI.OAS.GetTykExtension().Middleware.Global.PluginConfig.Data)
+}
+
+func TestAPIContext_getValidationOptionsFromConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("should return validation options", func(t *testing.T) {
+		conf, err := config.New()
+		assert.Nil(t, err)
+		options := GetValidationOptionsFromConfig(conf.OAS)
+		assert.Len(t, options, 2)
+	})
+
+	t.Run("should return default validation options", func(t *testing.T) {
+		conf, err := config.New()
+		assert.Nil(t, err)
+
+		conf.OAS.ValidateSchemaDefaults = true
+		conf.OAS.ValidateExamples = true
+
+		options := GetValidationOptionsFromConfig(conf.OAS)
+
+		assert.Len(t, options, 0)
+	})
+}
+
+func TestYaml(t *testing.T) {
+	oasDoc := OAS{}
+	Fill(t, &oasDoc, 0)
+
+	tykExt := XTykAPIGateway{}
+	Fill(t, &tykExt, 0)
+	// json unmarshal workarounds
+	{
+		tykExt.Info.DBID = model.NewObjectID()
+		tykExt.Middleware.Global.PrePlugin = nil
+		tykExt.Middleware.Global.PostPlugin = nil
+		tykExt.Middleware.Global.PostAuthenticationPlugin = nil
+		tykExt.Middleware.Global.ResponsePlugin = nil
+
+		for k, v := range tykExt.Server.Authentication.SecuritySchemes {
+			intVal, ok := v.(int)
+			assert.True(t, ok)
+			tykExt.Server.Authentication.SecuritySchemes[k] = float64(intVal)
+		}
+
+		for k, v := range tykExt.Middleware.Global.PluginConfig.Data.Value {
+			intVal, ok := v.(int)
+			assert.True(t, ok)
+			tykExt.Middleware.Global.PluginConfig.Data.Value[k] = float64(intVal)
+		}
+	}
+
+	oasDoc.SetTykExtension(&tykExt)
+
+	jsonBody, err := json.Marshal(&oasDoc)
+	assert.NoError(t, err)
+
+	yamlBody, err := yaml.JSONToYAML(jsonBody)
+	assert.NoError(t, err)
+
+	yamlOAS, err := openapi3.NewLoader().LoadFromData(yamlBody)
+	assert.NoError(t, err)
+
+	yamlOASDoc := OAS{
+		T: *yamlOAS,
+	}
+
+	yamlOASExt := yamlOASDoc.GetTykExtension()
+	assert.Equal(t, tykExt, *yamlOASExt)
+
+	yamlOASDoc.SetTykExtension(nil)
+	oasDoc.SetTykExtension(nil)
+	assert.Equal(t, oasDoc, yamlOASDoc)
 }

@@ -29,7 +29,8 @@ var (
 
 // CoProcessMiddleware is the basic CP middleware struct.
 type CoProcessMiddleware struct {
-	BaseMiddleware
+	*BaseMiddleware
+
 	HookType         coprocess.HookType
 	HookName         string
 	MiddlewareDriver apidef.MiddlewareDriver
@@ -43,13 +44,13 @@ func (m *CoProcessMiddleware) Name() string {
 }
 
 // CreateCoProcessMiddleware initializes a new CP middleware, takes hook type (pre, post, etc.), hook name ("my_hook") and driver ("python").
-func CreateCoProcessMiddleware(hookName string, hookType coprocess.HookType, mwDriver apidef.MiddlewareDriver, baseMid BaseMiddleware) func(http.Handler) http.Handler {
+func CreateCoProcessMiddleware(hookName string, hookType coprocess.HookType, mwDriver apidef.MiddlewareDriver, baseMid *BaseMiddleware) func(http.Handler) http.Handler {
 	dMiddleware := &CoProcessMiddleware{
 		BaseMiddleware:   baseMid,
 		HookType:         hookType,
 		HookName:         hookName,
 		MiddlewareDriver: mwDriver,
-		successHandler:   &SuccessHandler{baseMid},
+		successHandler:   &SuccessHandler{baseMid.Copy()},
 	}
 
 	return baseMid.Gw.createMiddleware(dMiddleware)
@@ -307,7 +308,7 @@ func (m *CoProcessMiddleware) EnabledForSpec() bool {
 	log.WithFields(logrus.Fields{
 		"prefix": "coprocess",
 	}).Debug("Enabling CP middleware.")
-	m.successHandler = &SuccessHandler{m.BaseMiddleware}
+	m.successHandler = &SuccessHandler{m.BaseMiddleware.Copy()}
 	return true
 }
 
@@ -444,7 +445,7 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 			ReadSeeker: strings.NewReader(returnObject.Request.ReturnOverrides.ResponseBody),
 		}
 		res.ContentLength = int64(len(returnObject.Request.ReturnOverrides.ResponseBody))
-		m.successHandler.RecordHit(r, analytics.Latency(analytics.Latency{Total: int64(ms)}), int(returnObject.Request.ReturnOverrides.ResponseCode), res)
+		m.successHandler.RecordHit(r, analytics.Latency(analytics.Latency{Total: int64(ms)}), int(returnObject.Request.ReturnOverrides.ResponseCode), res, false)
 		return nil, mwStatusRespond
 	}
 
@@ -512,15 +513,19 @@ func (m *CoProcessMiddleware) ProcessRequest(w http.ResponseWriter, r *http.Requ
 }
 
 type CustomMiddlewareResponseHook struct {
+	BaseTykResponseHandler
 	mw *CoProcessMiddleware
-	Gw *Gateway `json:"-"`
+}
+
+func (h CustomMiddlewareResponseHook) Base() *BaseTykResponseHandler {
+	return &h.BaseTykResponseHandler
 }
 
 func (h *CustomMiddlewareResponseHook) Init(mwDef interface{}, spec *APISpec) error {
 	mwDefinition := mwDef.(apidef.MiddlewareDefinition)
 
 	h.mw = &CoProcessMiddleware{
-		BaseMiddleware: BaseMiddleware{
+		BaseMiddleware: &BaseMiddleware{
 			Spec: spec,
 			Gw:   h.Gw,
 		},
@@ -542,7 +547,7 @@ func (h *CustomMiddlewareResponseHook) Name() string {
 }
 
 func (h *CustomMiddlewareResponseHook) HandleError(rw http.ResponseWriter, req *http.Request) {
-	handler := ErrorHandler{h.mw.BaseMiddleware}
+	handler := ErrorHandler{h.mw.BaseMiddleware.Copy()}
 	handler.HandleError(rw, req, "Middleware error", http.StatusInternalServerError, true)
 }
 
@@ -580,7 +585,7 @@ func (h *CustomMiddlewareResponseHook) HandleResponse(rw http.ResponseWriter, re
 	// check if we have changes in headers
 	if !areMapsEqual(object.Response.Headers, retObject.Response.Headers) {
 		// as we have changes we need to synchronize them
-		syncHeadersAndMultiValueHeaders(retObject.Response.Headers, retObject.Response.MultivalueHeaders)
+		retObject.Response.MultivalueHeaders = syncHeadersAndMultiValueHeaders(retObject.Response.Headers, retObject.Response.MultivalueHeaders)
 	}
 
 	// Set headers:
@@ -593,6 +598,12 @@ func (h *CustomMiddlewareResponseHook) HandleResponse(rw http.ResponseWriter, re
 	bodyBuf := bytes.NewBuffer(retObject.Response.RawBody)
 	res.Body = ioutil.NopCloser(bodyBuf)
 
+	//set response body length with the size of response body returned from the hook
+	//so that it is updated accordingly in the response object
+	responseBodyLen := len(retObject.Response.RawBody)
+	res.ContentLength = int64(responseBodyLen)
+	res.Header.Set("Content-Length", fmt.Sprintf("%d", responseBodyLen))
+
 	res.StatusCode = int(retObject.Response.StatusCode)
 	return nil
 }
@@ -600,6 +611,7 @@ func (h *CustomMiddlewareResponseHook) HandleResponse(rw http.ResponseWriter, re
 // syncHeadersAndMultiValueHeaders synchronizes the content of 'headers' and 'multiValueHeaders'.
 // If a key is updated or added in 'headers', the corresponding key in 'multiValueHeaders' is also updated or added.
 // If a key is removed from 'headers', the corresponding key in 'multiValueHeaders' is also removed.
+// If multiValuesHeaders contains a key with multiple values and the same key is present in headers, the first value in multiValuesHeaders is updated with the value from headers, while the remaining values remain unchanged.
 func syncHeadersAndMultiValueHeaders(headers map[string]string, multiValueHeaders []*coprocess.Header) []*coprocess.Header {
 	updatedMultiValueHeaders := []*coprocess.Header{}
 
@@ -608,7 +620,12 @@ func syncHeadersAndMultiValueHeaders(headers map[string]string, multiValueHeader
 		for _, header := range multiValueHeaders {
 			if header.Key == k {
 				found = true
-				header.Values = []string{v}
+
+				// if the key is present in multiValueHeaders, update the first value with the value from headers
+				if len(header.Values) > 0 {
+					header.Values[0] = v
+				}
+
 				break
 			}
 		}

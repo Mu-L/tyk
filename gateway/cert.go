@@ -41,6 +41,7 @@ type APIAllCertificateBasics struct {
 	Certs []*certs.CertificateBasics `json:"certs"`
 }
 
+// Deprecated: use tls.CipherSuites() now
 var cipherSuites = map[string]uint16{
 	"TLS_RSA_WITH_RC4_128_SHA":                0x0005,
 	"TLS_RSA_WITH_3DES_EDE_CBC_SHA":           0x000a,
@@ -327,7 +328,7 @@ func (gw *Gateway) getTLSConfigForClient(baseConfig *tls.Config, listenPort int)
 		var waitingRedisLog sync.Once
 		// ensure that we are connected to redis
 		for {
-			if gw.RedisController.Connected() {
+			if gw.StorageConnectionHandler.Connected() {
 				break
 			}
 
@@ -418,7 +419,7 @@ func (gw *Gateway) getTLSConfigForClient(baseConfig *tls.Config, listenPort int)
 					certIDs := append(spec.ClientCertificates, gwConfig.Security.Certificates.API...)
 
 					for _, cert := range gw.CertificateManager.List(certIDs, certs.CertificatePublic) {
-						if cert != nil {
+						if cert != nil && !crypto.IsPublicKey(cert) {
 							newConfig.ClientCAs.AddCert(cert.Leaf)
 						}
 					}
@@ -439,20 +440,18 @@ func (gw *Gateway) getTLSConfigForClient(baseConfig *tls.Config, listenPort int)
 			}
 
 			// Dynamically add API specific certificates
-			if len(spec.Certificates) != 0 {
+			if len(spec.Certificates) != 0 && !spec.DomainDisabled {
 				for _, cert := range gw.CertificateManager.List(spec.Certificates, certs.CertificatePrivate) {
 					if cert == nil {
 						continue
 					}
 					newConfig.Certificates = append(newConfig.Certificates, *cert)
 
-					if cert != nil {
-						if len(cert.Leaf.Subject.CommonName) > 0 {
-							newConfig.NameToCertificate[cert.Leaf.Subject.CommonName] = cert
-						}
-						for _, san := range cert.Leaf.DNSNames {
-							newConfig.NameToCertificate[san] = cert
-						}
+					if len(cert.Leaf.Subject.CommonName) > 0 {
+						newConfig.NameToCertificate[cert.Leaf.Subject.CommonName] = cert
+					}
+					for _, san := range cert.Leaf.DNSNames {
+						newConfig.NameToCertificate[san] = cert
 					}
 				}
 			}
@@ -583,12 +582,13 @@ func (gw *Gateway) certHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getCipherAliases(ciphers []string) (cipherCodes []uint16) {
-	for k, v := range cipherSuites {
-		for _, str := range ciphers {
-			if str == k {
-				cipherCodes = append(cipherCodes, v)
-			}
+	for _, v := range ciphers {
+		id, err := crypto.ResolveCipher(v)
+		if err != nil {
+			log.Debugf("cipher %s not found; skipped", v)
+			continue
 		}
+		cipherCodes = append(cipherCodes, id)
 	}
 	return cipherCodes
 }

@@ -1,23 +1,28 @@
 package gateway
 
 import (
-	"crypto"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	temporalmodel "github.com/TykTechnologies/storage/temporal/model"
 
-	"github.com/TykTechnologies/goverify"
+	"github.com/TykTechnologies/tyk/internal/crypto"
 	"github.com/TykTechnologies/tyk/storage"
 )
 
 type NotificationCommand string
+
+func (n NotificationCommand) String() string {
+	return string(n)
+}
 
 const (
 	RedisPubSubChannel = "tyk.cluster.notifications"
@@ -33,6 +38,9 @@ const (
 	NoticeGatewayConfigResponse  NotificationCommand = "NoticeGatewayConfigResponse"
 	NoticeGatewayDRLNotification NotificationCommand = "NoticeGatewayDRLNotification"
 	KeySpaceUpdateNotification   NotificationCommand = "KeySpaceUpdateNotification"
+	OAuthPurgeLapsedTokens       NotificationCommand = "OAuthPurgeLapsedTokens"
+	// NoticeDeleteAPICache is the command with which event is emitted from dashboard to invalidate cache for an API.
+	NoticeDeleteAPICache NotificationCommand = "DeleteAPICache"
 )
 
 // Notification is a type that encodes a message published to a pub sub channel (shared between implementations)
@@ -51,7 +59,7 @@ func (n *Notification) Sign() {
 }
 
 func (gw *Gateway) startPubSubLoop() {
-	cacheStore := storage.RedisCluster{RedisController: gw.RedisController}
+	cacheStore := storage.RedisCluster{ConnectionHandler: gw.StorageConnectionHandler}
 	cacheStore.Connect()
 
 	message := "Connection to Redis failed, reconnect in 10s"
@@ -88,12 +96,23 @@ func (gw *Gateway) logPubSubError(err error, message string) bool {
 }
 
 func (gw *Gateway) handleRedisEvent(v interface{}, handled func(NotificationCommand), reloaded func()) {
-	message, ok := v.(*redis.Message)
+	message, ok := v.(temporalmodel.Message)
 	if !ok {
 		return
 	}
+
+	if message.Type() != temporalmodel.MessageTypeMessage {
+		return
+	}
+
+	payload, err := message.Payload()
+	if err != nil {
+		pubSubLog.Error("Error getting payload from message: ", err)
+		return
+	}
+
 	notif := Notification{Gw: gw}
-	if err := json.Unmarshal([]byte(message.Payload), &notif); err != nil {
+	if err := json.Unmarshal([]byte(payload), &notif); err != nil {
 		pubSubLog.Error("Unmarshalling message body failed, malformed: ", err)
 		return
 	}
@@ -130,6 +149,14 @@ func (gw *Gateway) handleRedisEvent(v interface{}, handled func(NotificationComm
 		gw.reloadURLStructure(reloaded)
 	case KeySpaceUpdateNotification:
 		gw.handleKeySpaceEventCacheFlush(notif.Payload)
+	case OAuthPurgeLapsedTokens:
+		if err := gw.purgeLapsedOAuthTokens(); err != nil {
+			log.WithError(err).Errorf("error while purging tokens for event %s", OAuthPurgeLapsedTokens)
+		}
+	case NoticeDeleteAPICache:
+		if ok := gw.invalidateAPICache(notif.Payload); !ok {
+			log.WithError(err).Errorf("cache invalidation failed for: %s", notif.Payload)
+		}
 	default:
 		pubSubLog.Warnf("Unknown notification command: %q", notif.Command)
 		return
@@ -174,30 +201,21 @@ func isPayloadSignatureValid(notification Notification) bool {
 			return false
 		}
 	default:
-		if notification.Gw.GetConfig().PublicKeyPath != "" && notification.Gw.NotificationVerifier == nil {
-			var err error
-
-			notification.Gw.NotificationVerifier, err = goverify.LoadPublicKeyFromFile(notification.Gw.GetConfig().PublicKeyPath)
-			if err != nil {
-
-				pubSubLog.Error("Notification signer: Failed loading public key from path: ", err)
-				return false
-			}
+		verifier, err := notification.Gw.SignatureVerifier()
+		if err != nil {
+			pubSubLog.Error("Notification signer: Failed loading public key from path: ", err)
+			return false
 		}
 
-		if notification.Gw.NotificationVerifier != nil {
-
+		if verifier != nil {
 			signed, err := base64.StdEncoding.DecodeString(notification.Signature)
 			if err != nil {
-
 				pubSubLog.Error("Failed to decode signature: ", err)
 				return false
 			}
 
-			if err := notification.Gw.NotificationVerifier.Verify([]byte(notification.Payload), signed); err != nil {
-
+			if err := verifier.Verify([]byte(notification.Payload), signed); err != nil {
 				pubSubLog.Error("Could not verify notification: ", err, ": ", notification)
-
 				return false
 			}
 
@@ -233,7 +251,7 @@ func (r *RedisNotifier) Notify(notif interface{}) bool {
 	// pubSubLog.Debug("Sending notification", notif)
 
 	if err := r.store.Publish(r.channel, string(toSend)); err != nil {
-		if err != storage.ErrRedisIsDown {
+		if !errors.Is(err, storage.ErrRedisIsDown) {
 			pubSubLog.Error("Could not send notification: ", err)
 		}
 		return false

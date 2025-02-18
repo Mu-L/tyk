@@ -7,13 +7,13 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
 
 	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/internal/otel"
 	logger "github.com/TykTechnologies/tyk/log"
 	"github.com/TykTechnologies/tyk/regexp"
 )
@@ -48,6 +48,14 @@ var (
 		CoProcessOptions: CoProcessConfig{
 			EnableCoProcess: false,
 		},
+		LivenessCheck: LivenessCheckConfig{
+			CheckDuration: time.Second * 10,
+		},
+		Streaming: StreamingConfig{
+			Enabled:     false,
+			AllowUnsafe: []string{},
+		},
+		PIDFileLocation: "/var/run/tyk/tyk-gateway.pid",
 	}
 )
 
@@ -63,6 +71,8 @@ const (
 
 	DefaultDashPolicySource     = "service"
 	DefaultDashPolicyRecordName = "tyk_policies"
+
+	DefaultOTelResourceName = "tyk-gateway"
 )
 
 type PoliciesConfig struct {
@@ -73,8 +83,9 @@ type PoliciesConfig struct {
 	// Set this to the URL of your Tyk Dashboard installation. The URL needs to be formatted as: http://dashboard_host:port.
 	PolicyConnectionString string `json:"policy_connection_string"`
 
-	// This option is required if `policies.policy_source` is set to `file`.
-	// Specifies the path of your JSON file containing the available policies.
+	// This option only applies in OSS deployment when the `policies.policy_source` is either set
+	// to `file` or an empty string. If `policies.policy_path` is not set, then Tyk will load policies
+	// from the JSON file specified by `policies.policy_record_name`.
 	PolicyRecordName string `json:"policy_record_name"`
 
 	// In a Pro installation, Tyk will load Policy IDs and use the internal object-ID as the ID of the policy.
@@ -84,8 +95,10 @@ type PoliciesConfig struct {
 	//
 	// This option should only be used when moving an installation to a new database.
 	AllowExplicitPolicyID bool `json:"allow_explicit_policy_id"`
-	// This option is used for storing a policies  if `policies.policy_source` is set to `file`.
-	// it should be some existing file path on hard drive
+	// This option only applies in OSS deployment when the `policies.policy_source` is either set
+	// to `file` or an empty string. If `policies.policy_path` is set, then Tyk will load policies
+	// from all the JSON files under the directory specified by the `policies.policy_path` option.
+	// In this configuration, Tyk Gateway will allow policy management through the Gateway API.
 	PolicyPath string `json:"policy_path"`
 }
 
@@ -136,6 +149,20 @@ type StorageOptionsConf struct {
 	UseSSL bool `json:"use_ssl"`
 	// Disable TLS verification
 	SSLInsecureSkipVerify bool `json:"ssl_insecure_skip_verify"`
+	// Path to the CA file.
+	CAFile string `json:"ca_file"`
+	// Path to the cert file.
+	CertFile string `json:"cert_file"`
+	// Path to the key file.
+	KeyFile string `json:"key_file"`
+	// Maximum TLS version that is supported.
+	// Options: ["1.0", "1.1", "1.2", "1.3"].
+	// Defaults to "1.3".
+	TLSMaxVersion string `json:"tls_max_version"`
+	// Minimum TLS version that is supported.
+	// Options: ["1.0", "1.1", "1.2", "1.3"].
+	// Defaults to "1.2".
+	TLSMinVersion string `json:"tls_min_version"`
 }
 
 type NormalisedURLConfig struct {
@@ -151,6 +178,15 @@ type NormalisedURLConfig struct {
 	// Each UUID will be replaced with a placeholder {uuid}
 	NormaliseUUIDs bool `json:"normalise_uuids"`
 
+	// Set this to true to have Tyk automatically clean up ULIDs. It will match the following style:
+	//
+	// * `/posts/01G9HHNKWGBHCQX7VG3JKSZ055/comments`
+	// * `/posts/01g9hhnkwgbhcqx7vg3jksz055/comments`
+	// * `/posts/01g9HHNKwgbhcqx7vg3JKSZ055/comments`
+
+	// Each ULID will be replaced with a placeholder {ulid}
+	NormaliseULIDs bool `json:"normalise_ulids"`
+
 	// Set this to true to have Tyk automatically match for numeric IDs, it will match with a preceding slash so as not to capture actual numbers:
 	NormaliseNumbers bool `json:"normalise_numbers"`
 
@@ -162,6 +198,7 @@ type NormalisedURLConfig struct {
 
 type NormaliseURLPatterns struct {
 	UUIDs  *regexp.Regexp
+	ULIDs  *regexp.Regexp
 	IDs    *regexp.Regexp
 	Custom []*regexp.Regexp
 }
@@ -177,7 +214,7 @@ type AnalyticsConfigConfig struct {
 
 	// Set this value to `true` to have Tyk store the inbound request and outbound response data in HTTP Wire format as part of the Analytics data.
 	// Please note, this will greatly increase your analytics DB size and can cause performance degradation on analytics processing by the Dashboard.
-	// This setting can be overridden with an organisation flag, enabed at an API level, or on individual Key level.
+	// This setting can be overridden with an organization flag, enabed at an API level, or on individual Key level.
 	EnableDetailedRecording bool `json:"enable_detailed_recording"`
 
 	// Tyk can store GeoIP information based on MaxMind DB’s to enable GeoIP tracking on inbound request analytics. Set this value to `true` and assign a DB using the `geo_ip_db_path` setting.
@@ -213,6 +250,33 @@ type AnalyticsConfigConfig struct {
 	SerializerType string `json:"serializer_type"`
 }
 
+// AccessLogsConfig defines the type of transactions logs printed to stdout.
+type AccessLogsConfig struct {
+	// Enabled controls enabling the transaction logs. Default: false.
+	Enabled bool `json:"enabled"`
+
+	// Template configures which fields to log into the access log.
+	// If unconfigured, all fields listed will be logged.
+	//
+	// Example: ["client_ip", "path"].
+	//
+	// Template Options:
+	//
+	// - `api_key` will include they obfuscated or hashed key.
+	// - `client_ip` will include the ip of the request.
+	// - `host` will include the host of the request.
+	// - `method` will include the request method.
+	// - `path` will include the path of the request.
+	// - `protocol` will include the protocol of the request.
+	// - `remote_addr` will include the remote address of the request.
+	// - `upstream_addr` will include the upstream address (scheme, host and path)
+	// - `upstream_latency` will include the upstream latency of the request.
+	// - `latency_total` will include the total latency of the request.
+	// - `user_agent` will include the user agent of the request.
+	// - `status` will include the response status code.
+	Template []string `json:"template"`
+}
+
 type HealthCheckConfig struct {
 	// Setting this value to `true` will enable the health-check endpoint on /Tyk/health.
 	EnableHealthChecks bool `json:"enable_health_checks"`
@@ -224,7 +288,9 @@ type HealthCheckConfig struct {
 }
 
 type LivenessCheckConfig struct {
-	// Frequencies of performing interval healthchecks for Redis, Dashboard, and RPC layer. Default: 10 seconds.
+	// Frequencies of performing interval healthchecks for Redis, Dashboard, and RPC layer.
+	// Expressed in Nanoseconds. For example: 1000000000 -> 1s.
+	// Default: 10 seconds.
 	CheckDuration time.Duration `json:"check_duration"`
 }
 
@@ -256,7 +322,7 @@ type MonitorConfig struct {
 	GlobalTriggerLimit float64 `json:"global_trigger_limit"`
 	// Apply the monitoring subsystem to user keys.
 	MonitorUserKeys bool `json:"monitor_user_keys"`
-	// Apply the monitoring subsystem to organisation keys.
+	// Apply the monitoring subsystem to organization keys.
 	MonitorOrgKeys bool `json:"monitor_org_keys"`
 }
 
@@ -287,10 +353,10 @@ type SlaveOptionsConfig struct {
 	// Use this setting to add the URL for your MDCB or load balancer host.
 	ConnectionString string `json:"connection_string"`
 
-	// Your organisation ID to connect to the MDCB installation.
+	// Your organization ID to connect to the MDCB installation.
 	RPCKey string `json:"rpc_key"`
 
-	// This the API key of a user used to authenticate and authorise the Gateway’s access through MDCB.
+	// This the API key of a user used to authenticate and authorize the Gateway’s access through MDCB.
 	// The user should be a standard Dashboard user with minimal privileges so as to reduce any risk if the user is compromised.
 	// The suggested security settings are read for Real-time notifications and the remaining options set to deny.
 	APIKey string `json:"api_key"`
@@ -301,11 +367,11 @@ type SlaveOptionsConfig struct {
 	// For an Self-Managed installation this can be left at `false` (the default setting). For Legacy Cloud Gateways it must be set to ‘true’.
 	BindToSlugsInsteadOfListenPaths bool `json:"bind_to_slugs"`
 
-	// Set this option to `true` if you don’t want to monitor changes in the keys from a master Gateway.
+	// Set this option to `true` if you don’t want to monitor changes in the keys from a primary Gateway.
 	DisableKeySpaceSync bool `json:"disable_keyspace_sync"`
 
-	// This is the `zone` that this instance inhabits, e.g. the cluster/data-centre the Gateway lives in.
-	// The group ID must be the same across all the Gateways of a data-centre/cluster which are also sharing the same Redis instance.
+	// This is the `zone` that this instance inhabits, e.g. the cluster/data-center the Gateway lives in.
+	// The group ID must be the same across all the Gateways of a data-center/cluster which are also sharing the same Redis instance.
 	// This ID should also be unique per cluster (otherwise another Gateway cluster can pick up your keyspace events and your cluster will get zero updates).
 	GroupID string `json:"group_id"`
 
@@ -372,6 +438,45 @@ type HttpServerOptionsConfig struct {
 	//
 	// Regular expressions and parameterized routes will be left alone regardless of this setting.
 	EnableStrictRoutes bool `json:"enable_strict_routes"`
+
+	// EnablePathPrefixMatching changes how the gateway matches incoming URL paths against routes (patterns) defined in the API definition.
+	// By default, the gateway uses wildcard matching. When EnablePathPrefixMatching is enabled, it switches to prefix matching. For example, a defined path such as `/json` will only match request URLs that begin with `/json`, rather than matching any URL containing `/json`.
+	//
+	// The gateway checks the request URL against several variations depending on whether path versioning is enabled:
+	// - Full path (listen path + version + endpoint): `/listen-path/v4/json`
+	// - Non-versioned full path (listen path + endpoint): `/listen-path/json`
+	// - Path without version (endpoint only): `/json`
+	//
+	// For patterns that start with `/`, the gateway prepends `^` before performing the check, ensuring a true prefix match.
+	// For patterns that start with `^`, the gateway will already perform prefix matching so EnablePathPrefixMatching will have no impact.
+	// This option allows for more specific and controlled routing of API requests, potentially reducing unintended matches. Note that you may need to adjust existing route definitions when enabling this option.
+	//
+	// Example:
+	//
+	// With wildcard matching, `/json` might match `/api/v1/data/json`.
+	// With prefix matching, `/json` would not match `/api/v1/data/json`, but would match `/json/data`.
+	//
+	// Combining EnablePathPrefixMatching with EnablePathSuffixMatching will result in exact URL matching, with `/json` being evaluated as `^/json$`.
+	EnablePathPrefixMatching bool `json:"enable_path_prefix_matching"`
+
+	// EnablePathSuffixMatching changes how the gateway matches incoming URL paths against routes (patterns) defined in the API definition.
+	// By default, the gateway uses wildcard matching. When EnablePathSuffixMatching is enabled, it switches to suffix matching. For example, a defined path such as `/json` will only match request URLs that end with `/json`, rather than matching any URL containing `/json`.
+	//
+	// The gateway checks the request URL against several variations depending on whether path versioning is enabled:
+	// - Full path (listen path + version + endpoint): `/listen-path/v4/json`
+	// - Non-versioned full path (listen path + endpoint): `/listen-path/json`
+	// - Path without version (endpoint only): `/json`
+	//
+	// For patterns that already end with `$`, the gateway will already perform suffix matching so EnablePathSuffixMatching will have no impact. For all other patterns, the gateway appends `$` before performing the check, ensuring a true suffix match.
+	// This option allows for more specific and controlled routing of API requests, potentially reducing unintended matches. Note that you may need to adjust existing route definitions when enabling this option.
+	//
+	// Example:
+	//
+	// With wildcard matching, `/json` might match `/api/v1/json/data`.
+	// With suffix matching, `/json` would not match `/api/v1/json/data`, but would match `/api/v1/json`.
+	//
+	// Combining EnablePathSuffixMatching with EnablePathPrefixMatching will result in exact URL matching, with `/json` being evaluated as `^/json$`.
+	EnablePathSuffixMatching bool `json:"enable_path_suffix_matching"`
 
 	// Disable TLS verification. Required if you are using self-signed certificates.
 	SSLInsecureSkipVerify bool `json:"ssl_insecure_skip_verify"`
@@ -483,7 +588,10 @@ type CoProcessConfig struct {
 
 type CertificatesConfig struct {
 	API []string `json:"apis"`
-	// Specify upstream mutual TLS certificates at a global level in the following format: `{ "<host>": "<cert>" }``
+	// Upstream is used to specify the certificates to be used in mutual TLS connections to upstream services. These are set at gateway level as a map of domain -> certificate id or path.
+	// For example if you want Tyk to use the certificate `ab23ef123` for requests to the `example.com` upstream and `/certs/default.pem` for all other upstreams then:
+	// In `tyk.conf` you would configure `"security": {"certificates": {"upstream": {"*": "/certs/default.pem", "example.com": "ab23ef123"}}}`
+	// And if using environment variables you would set this to `*:/certs/default.pem,example.com:ab23ef123`.
 	Upstream map[string]string `json:"upstream"`
 	// Certificates used for Control API Mutual TLS
 	ControlAPI []string `json:"control_api"`
@@ -576,13 +684,14 @@ func (pwl *PortsWhiteList) Decode(value string) error {
 	return nil
 }
 
+// StreamingConfig is for configuring tyk streaming
+type StreamingConfig struct {
+	Enabled     bool     `json:"enabled"`
+	AllowUnsafe []string `json:"allow_unsafe"`
+}
+
 // Config is the configuration object used by Tyk to set up various parameters.
 type Config struct {
-	// OriginalPath is the path to the config file that is read. If
-	// none was found, it's the path to the default config file that
-	// was written.
-	OriginalPath string `json:"-"`
-
 	// Force your Gateway to work only on a specific domain name. Can be overridden by API custom domain.
 	HostName string `json:"hostname"`
 
@@ -630,10 +739,17 @@ type Config struct {
 	// Disable dynamic API and Policy reloads, e.g. it will load new changes only on procecss start.
 	SuppressRedisSignalReload bool `json:"suppress_redis_signal_reload"`
 
+	// ReloadInterval defines a duration in seconds within which the gateway responds to a reload event.
+	// The value defaults to 1, values lower than 1 are ignored.
+	ReloadInterval int64 `json:"reload_interval"`
+
 	// Enable Key hashing
 	HashKeys bool `json:"hash_keys"`
 
 	// DisableKeyActionsByUsername disables key search by username.
+	// When this is set to `true` you are able to search for keys only by keyID or key hash (if `hash_keys` is also set to `true`)
+	// Note that if `hash_keys` is also set to `true` then the keyID will not be provided for APIs secured using basic auth. In this scenario the only search option would be to use key hash
+	// If you are using the Tyk Dashboard, you must configure this setting with the same value in both Gateway and Dashboard
 	DisableKeyActionsByUsername bool `json:"disable_key_actions_by_username"`
 
 	// Specify the Key hashing algorithm. Possible values: murmur64, murmur128, sha256.
@@ -660,9 +776,11 @@ type Config struct {
 	// A policy can be defined in a file (Open Source installations) or from the same database as the Dashboard.
 	Policies PoliciesConfig `json:"policies"`
 
-	// Defines the ports that will be available for the API services to bind to in the following format: `"{“":“”}"`. Remember to escape JSON strings.
-	// This is a map of protocol to PortWhiteList. This allows per protocol
-	// configurations.
+	// Defines the ports that will be available for the API services to bind to in the format
+	// documented here https://tyk.io/docs/key-concepts/tcp-proxy/#allowing-specific-ports.
+	// Ports can be configured per protocol, e.g. https, tls etc.
+	// If configuring via environment variable `TYK_GW_PORTWHITELIST` then remember to escape
+	// JSON strings.
 	PortWhiteList PortsWhiteList `json:"ports_whitelist"`
 
 	// Disable port whilisting, essentially allowing you to use any port for your API.
@@ -686,7 +804,7 @@ type Config struct {
 
 	// Disable the capability of the Gateway to `autodiscover` the Dashboard through heartbeat messages via Redis.
 	// The goal of zeroconf is auto-discovery, so you do not have to specify the Tyk Dashboard address in your Gateway`tyk.conf` file.
-	// In some specific cases, for example, when the Dashboard is bound to a public domain, not accessible inside an internal network, or similar, `disable_dashboard_zeroconf` can be set to `true`, in favour of directly specifying a Tyk Dashboard address.
+	// In some specific cases, for example, when the Dashboard is bound to a public domain, not accessible inside an internal network, or similar, `disable_dashboard_zeroconf` can be set to `true`, in favor of directly specifying a Tyk Dashboard address.
 	DisableDashboardZeroConf bool `json:"disable_dashboard_zeroconf"`
 
 	// The `slave_options` allow you to configure the RPC slave connection required for MDCB installations.
@@ -698,51 +816,33 @@ type Config struct {
 	// Note:
 	//   If you set `db_app_conf_options.node_is_segmented` to `true` for multiple Gateway nodes, you should ensure that `management_node` is set to `false`.
 	//   This is to ensure visibility for the management node across all APIs.
+	//
+	//   For pro installations, `management_node` is not a valid configuration option.
+	//   Always set `management_node` to `false` in pro environments.
 	ManagementNode bool `json:"management_node"`
 
 	// This is used as part of the RPC / Hybrid back-end configuration in a Tyk Enterprise installation and isn’t used anywhere else.
 	AuthOverride AuthOverrideConf `json:"auth_override"`
 
-	// Redis based rate limiter with fixed window. Provides 100% rate limiting accuracy, but require two additional Redis roundtrip for each request.
-	EnableRedisRollingLimiter bool `json:"enable_redis_rolling_limiter"`
+	// RateLimit encapsulates rate limit configuration definitions.
+	RateLimit
 
-	// To enable, set to `true`. The sentinel-based rate limiter delivers a smoother performance curve as rate-limit calculations happen off-thread, but a stricter time-out based cool-down for clients. For example, when a throttling action is triggered, they are required to cool-down for the period of the rate limit.
-	// Disabling the sentinel based rate limiter will make rate-limit calculations happen on-thread and therefore offers a staggered cool-down and a smoother rate-limit experience for the client.
-	// For example, you can slow your connection throughput to regain entry into your rate limit. This is more of a “throttle” than a “block”.
-	// The standard rate limiter offers similar performance as the sentinel-based limiter. This is disabled by default.
-	EnableSentinelRateLimiter bool `json:"enable_sentinel_rate_limiter"`
-
-	// An enhancement for the Redis and Sentinel rate limiters, that offers a significant improvement in performance by not using transactions on Redis rate-limit buckets.
-	EnableNonTransactionalRateLimiter bool `json:"enable_non_transactional_rate_limiter"`
-
-	// How frequently a distributed rate limiter synchronises information between the Gateway nodes. Default: 2 seconds.
-	DRLNotificationFrequency int `json:"drl_notification_frequency"`
-
-	// A distributed rate limiter is inaccurate on small rate limits, and it will fallback to a Redis or Sentinel rate limiter on an individual user basis, if its rate limiter lower then threshold.
-	// A Rate limiter threshold calculated using the following formula: `rate_threshold = drl_threshold * number_of_gateways`.
-	// So you have 2 Gateways, and your threshold is set to 5, if a user rate limit is larger than 10, it will use the distributed rate limiter algorithm.
-	// Default: 5
-	DRLThreshold float64 `json:"drl_threshold"`
-
-	// Controls which algorthm to use as a fallback when your distributed rate limiter can't be used.
-	DRLEnableSentinelRateLimiter bool `json:"drl_enable_sentinel_rate_limiter"`
-
-	// Allows you to dynamically configure analytics expiration on a per organisation level
+	// Allows you to dynamically configure analytics expiration on a per organization level
 	EnforceOrgDataAge bool `json:"enforce_org_data_age"`
 
-	// Allows you to dynamically configure detailed logging on a per organisation level
+	// Allows you to dynamically configure detailed logging on a per organization level
 	EnforceOrgDataDetailLogging bool `json:"enforce_org_data_detail_logging"`
 
-	// Allows you to dynamically configure organisation quotas on a per organisation level
+	// Allows you to dynamically configure organization quotas on a per organization level
 	EnforceOrgQuotas bool `json:"enforce_org_quotas"`
 
 	ExperimentalProcessOrgOffThread bool `json:"experimental_process_org_off_thread"`
 
-	// The monitor section is useful if you wish to enforce a global trigger limit on organisation and user quotas.
+	// The monitor section is useful if you wish to enforce a global trigger limit on organization and user quotas.
 	// This feature will trigger a webhook event to fire when specific triggers are reached.
-	// Triggers can be global (set in the node), by organisation (set in the organisation session object) or by key (set in the key session object)
+	// Triggers can be global (set in the node), by organization (set in the organization session object) or by key (set in the key session object)
 	//
-	// While Organisation-level and Key-level triggers can be tiered (e.g. trigger at 10%, trigger at 20%, trigger at 80%), in the node-level configuration only a global value can be set.
+	// While Organization-level and Key-level triggers can be tiered (e.g. trigger at 10%, trigger at 20%, trigger at 80%), in the node-level configuration only a global value can be set.
 	// If a global value and specific trigger level are the same the trigger will only fire once:
 	//
 	// ```
@@ -779,7 +879,7 @@ type Config struct {
 
 	// If AllowMasterKeys is set to true, session objects (key definitions) that do not have explicit access rights set
 	// will be allowed by Tyk. This means that keys that are created have access to ALL APIs, which in many cases is
-	// unwanted behaviour unless you are sure about what you are doing.
+	// unwanted behavior unless you are sure about what you are doing.
 	AllowMasterKeys bool `json:"allow_master_keys"`
 
 	ServiceDiscovery ServiceDiscoveryConf `json:"service_discovery"`
@@ -796,10 +896,11 @@ type Config struct {
 	// Maximum TLS version for connection between Tyk and your upstream service.
 	ProxySSLMaxVersion uint16 `json:"proxy_ssl_max_version"`
 
-	// Whitelist ciphers for connection between Tyk and your upstream service.
+	// Allow list of ciphers for connection between Tyk and your upstream service.
 	ProxySSLCipherSuites []string `json:"proxy_ssl_ciphers"`
 
 	// This can specify a default timeout in seconds for upstream API requests.
+	// Default: 30 seconds
 	ProxyDefaultTimeout float64 `json:"proxy_default_timeout"`
 
 	// Disable TLS renegotiation.
@@ -934,8 +1035,20 @@ type Config struct {
 	// If not set or left empty, it will default to `info`.
 	LogLevel string `json:"log_level"`
 
+	// You can now configure the log format to be either the standard or json format
+	// If not set or left empty, it will default to `standard`.
+	LogFormat string `json:"log_format"`
+
+	// AccessLogs configures the output for access logs.
+	// If not configured, the access log is disabled.
+	AccessLogs AccessLogsConfig `json:"access_logs"`
+
 	// Section for configuring OpenTracing support
+	// Deprecated: use OpenTelemetry instead.
 	Tracer Tracer `json:"tracing"`
+
+	// Section for configuring OpenTelemetry.
+	OpenTelemetry otel.OpenTelemetry `json:"opentelemetry"`
 
 	NewRelic NewRelicConfig `json:"newrelic"`
 
@@ -1004,7 +1117,17 @@ type Config struct {
 		Vault  VaultConfig  `json:"vault"`
 	} `json:"kv"`
 
-	// Secrets are key-value pairs that can be accessed in the dashboard via "secrets://"
+	// Secrets configures a list of key/value pairs for the gateway.
+	// When configuring it via environment variable, the expected value
+	// is a comma separated list of key-value pairs delimited with a colon.
+	//
+	// Example: `TYK_GW_SECRETS=key1:value1,key2:/value2`
+	// Produces: `{"key1": "value1", "key2": "/value2"}`
+	//
+	// The secret value may be used as `secrets://key1` from the API definition.
+	// In versions before gateway 5.3, only `listen_path` and `target_url` fields
+	// have had the secrets replaced.
+	// See more details https://tyk.io/docs/tyk-configuration-reference/kv-store/#how-to-access-the-externally-stored-data
 	Secrets map[string]string `json:"secrets"`
 
 	// Override the default error code and or message returned by middleware.
@@ -1025,7 +1148,7 @@ type Config struct {
 	// "override_messages": {
 	//   "oauth.auth_field_missing" : {
 	//    "code": 401,
-	//    "message": "Token is not authorised"
+	//    "message": "Token is not authorized"
 	//  }
 	// }
 	// ```
@@ -1036,6 +1159,55 @@ type Config struct {
 
 	// Skip TLS verification for JWT JWKs url validation
 	JWTSSLInsecureSkipVerify bool `json:"jwt_ssl_insecure_skip_verify"`
+
+	// ResourceSync configures mitigation strategy in case sync fails.
+	ResourceSync ResourceSyncConfig `json:"resource_sync"`
+
+	// Private contains configuration fields for internal app usage.
+	Private Private `json:"-"`
+
+	// DevelopmentConfig struct extends configuration for development builds.
+	DevelopmentConfig
+
+	// OAS holds the configuration for various OpenAPI-specific functionalities
+	OAS OASConfig `json:"oas_config"`
+
+	Streaming StreamingConfig `json:"streaming"`
+
+	Labs LabsConfig `json:"labs"`
+}
+
+// LabsConfig include config for streaming
+type LabsConfig map[string]interface{}
+
+// Decode unmarshals json config into the Labs config
+func (lc *LabsConfig) Decode(value string) error {
+	var temp map[string]interface{}
+	if err := json.Unmarshal([]byte(value), &temp); err != nil {
+		log.Error("Error unmarshalling LabsConfig: ", err)
+		return err
+	}
+	*lc = temp
+	return nil
+}
+
+// OASConfig holds the configuration for various OpenAPI-specific functionalities
+type OASConfig struct {
+	// ValidateExamples enables validation of values provided in `example` and `examples` fields against the declared schemas in the OpenAPI Document. Defaults to false.
+	ValidateExamples bool `json:"validate_examples"`
+
+	// ValidateSchemaDefaults enables validation of values provided in `default` fields against the declared schemas in the OpenAPI Document. Defaults to false.
+	ValidateSchemaDefaults bool `json:"validate_schema_defaults"`
+}
+
+type ResourceSyncConfig struct {
+	// RetryAttempts defines the number of retries that the Gateway
+	// should perform during a resource sync (APIs or policies), defaulting
+	// to zero which means no retries are attempted.
+	RetryAttempts int `json:"retry_attempts"`
+
+	// Interval configures the interval in seconds between each retry on a resource sync error.
+	Interval int `json:"interval"`
 }
 
 type TykError struct {
@@ -1128,6 +1300,7 @@ func (c Config) GetEventTriggers() map[apidef.TykEvent][]TykEventHandler {
 	return c.EventTriggersDefunct
 }
 
+// SetEventTriggers sets events for backwards compatibility
 func (c *Config) SetEventTriggers(eventTriggers map[apidef.TykEvent][]TykEventHandler) {
 	c.EventTriggersDefunct = eventTriggers
 }
@@ -1167,20 +1340,21 @@ func WriteConf(path string, conf *Config) error {
 
 // writeDefault will set conf to the default config and write it to disk
 // in path, if the path is non-empty.
-func WriteDefault(path string, conf *Config) error {
-	_, b, _, _ := runtime.Caller(0)
-	configPath := filepath.Dir(b)
-	rootPath := filepath.Dir(configPath)
-	Default.TemplatePath = filepath.Join(rootPath, "templates")
+func WriteDefault(in string, conf *Config) error {
+	wd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("Can't get working directory: %w", err)
+	}
 
 	*conf = Default
+	conf.TemplatePath = filepath.Join(wd, "templates")
 	if err := envconfig.Process(envPrefix, conf); err != nil {
 		return err
 	}
-	if path == "" {
+	if in == "" {
 		return nil
 	}
-	return WriteConf(path, conf)
+	return WriteConf(in, conf)
 }
 
 // Load will load a configuration file, trying each of the paths given
@@ -1198,7 +1372,7 @@ func Load(paths []string, conf *Config) error {
 		if err == nil {
 			r = f
 			defer r.Close()
-			conf.OriginalPath = filename
+			conf.Private.OriginalPath = filename
 			break
 		}
 		if os.IsNotExist(err) {
@@ -1207,30 +1381,42 @@ func Load(paths []string, conf *Config) error {
 		return err
 	}
 
-	if r == nil {
-		path := paths[0]
-		log.Warnf("No config file found, writing default to %s", path)
-		if err := WriteDefault(path, conf); err != nil {
+	if len(paths) > 0 && r == nil {
+		filename := paths[0]
+		log.Warnf("No config file found, writing default to %s", filename)
+		if err := WriteDefault(filename, conf); err != nil {
 			return err
 		}
 		log.Info("Loading default configuration...")
-		return Load([]string{path}, conf)
+		return Load([]string{filename}, conf)
 	}
 
-	if err := json.NewDecoder(r).Decode(&conf); err != nil {
-		return fmt.Errorf("couldn't unmarshal config: %v", err)
+	if r != nil {
+		if err := json.NewDecoder(r).Decode(&conf); err != nil {
+			return fmt.Errorf("couldn't unmarshal config: %w", err)
+		}
 	}
 
+	if err := FillEnv(conf); err != nil {
+		log.WithError(err).Error("Failed to process environment variables after config file load")
+		return err
+	}
+
+	return nil
+}
+
+// FillEnv will inspect the environment and fill the config.
+func FillEnv(conf *Config) error {
 	shouldOmit, omitEnvExist := os.LookupEnv(envPrefix + "_OMITCONFIGFILE")
 	if omitEnvExist && strings.ToLower(shouldOmit) == "true" {
 		*conf = Config{}
 	}
 
 	if err := envconfig.Process(envPrefix, conf); err != nil {
-		return fmt.Errorf("failed to process config env vars: %v", err)
+		return fmt.Errorf("failed to process config env vars: %w", err)
 	}
 	if err := processCustom(envPrefix, conf, loadZipkin, loadJaeger); err != nil {
-		return fmt.Errorf("failed to process config custom loader: %v", err)
+		return fmt.Errorf("failed to process config custom loader: %w", err)
 	}
 	return nil
 }

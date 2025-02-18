@@ -24,7 +24,7 @@ const (
 
 // Token holds the values related to authentication tokens.
 type Token struct {
-	// Enabled enables the token based authentication mode.
+	// Enabled activates the token based authentication mode.
 	//
 	// Tyk classic API definition: `auth_configs["authToken"].use_standard_auth`
 	Enabled bool `bson:"enabled" json:"enabled"` // required
@@ -95,19 +95,70 @@ func (s *OAS) extractTokenTo(api *apidef.APIDefinition, name string) {
 
 // JWT holds the configuration for the JWT middleware.
 type JWT struct {
-	Enabled                 bool `bson:"enabled" json:"enabled"` // required
-	AuthSources             `bson:",inline" json:",inline"`
-	Source                  string   `bson:"source,omitempty" json:"source,omitempty"`
-	SigningMethod           string   `bson:"signingMethod,omitempty" json:"signingMethod,omitempty"`
-	IdentityBaseField       string   `bson:"identityBaseField,omitempty" json:"identityBaseField,omitempty"`
-	SkipKid                 bool     `bson:"skipKid,omitempty" json:"skipKid,omitempty"`
-	PolicyFieldName         string   `bson:"policyFieldName,omitempty" json:"policyFieldName,omitempty"`
-	ClientBaseField         string   `bson:"clientBaseField,omitempty" json:"clientBaseField,omitempty"`
-	Scopes                  *Scopes  `bson:"scopes,omitempty" json:"scopes,omitempty"`
-	DefaultPolicies         []string `bson:"defaultPolicies,omitempty" json:"defaultPolicies,omitempty"`
-	IssuedAtValidationSkew  uint64   `bson:"issuedAtValidationSkew,omitempty" json:"issuedAtValidationSkew,omitempty"`
-	NotBeforeValidationSkew uint64   `bson:"notBeforeValidationSkew,omitempty" json:"notBeforeValidationSkew,omitempty"`
-	ExpiresAtValidationSkew uint64   `bson:"expiresAtValidationSkew,omitempty" json:"expiresAtValidationSkew,omitempty"`
+	// Enabled activates the basic authentication mode.
+	//
+	// Tyk classic API definition: `enable_jwt`
+	Enabled bool `bson:"enabled" json:"enabled"` // required
+
+	// AuthSources configures the source for the JWT.
+	AuthSources `bson:",inline" json:",inline"`
+
+	// Source contains the source for the JWT.
+	//
+	// Tyk classic API definition: `jwt_source`
+	Source string `bson:"source,omitempty" json:"source,omitempty"`
+
+	// SigningMethod contains the signing method to use for the JWT.
+	//
+	// Tyk classic API definition: `jwt_signing_method`
+	SigningMethod string `bson:"signingMethod,omitempty" json:"signingMethod,omitempty"`
+
+	// IdentityBaseField specifies the claim name uniquely identifying the subject of the JWT.
+	// The identity fields that are checked in order are: `kid`, IdentityBaseField, `sub`.
+	//
+	// Tyk classic API definition: `jwt_identity_base_field`
+	IdentityBaseField string `bson:"identityBaseField,omitempty" json:"identityBaseField,omitempty"`
+
+	// SkipKid controls skipping using the `kid` claim from a JWT (default behaviour).
+	// When this is true, the field configured in IdentityBaseField is checked first.
+	//
+	// Tyk classic API definition: `jwt_skip_kid`
+	SkipKid bool `bson:"skipKid,omitempty" json:"skipKid,omitempty"`
+
+	// PolicyFieldName is a configurable claim name from which a policy ID is extracted.
+	// The policy is applied to the session as a base policy.
+	//
+	// Tyk classic API definition: `jwt_policy_field_name`
+	PolicyFieldName string `bson:"policyFieldName,omitempty" json:"policyFieldName,omitempty"`
+
+	// ClientBaseField is used when PolicyFieldName is not provided. It will get
+	// a session key and use the policies from that. The field ensures that requests
+	// use the same session.
+	//
+	// Tyk classic API definition: `jwt_client_base_field`
+	ClientBaseField string `bson:"clientBaseField,omitempty" json:"clientBaseField,omitempty"`
+
+	// Scopes holds the scope to policy mappings for a claim name.
+	Scopes *Scopes `bson:"scopes,omitempty" json:"scopes,omitempty"`
+
+	// DefaultPolicies is a list of policy IDs that apply to the session.
+	//
+	// Tyk classic API definition: `jwt_default_policies`
+	DefaultPolicies []string `bson:"defaultPolicies,omitempty" json:"defaultPolicies,omitempty"`
+
+	// IssuedAtValidationSkew contains the duration in seconds for which token issuance can predate the current time during the request.
+	IssuedAtValidationSkew uint64 `bson:"issuedAtValidationSkew,omitempty" json:"issuedAtValidationSkew,omitempty"`
+
+	// NotBeforeValidationSkew contains the duration in seconds for which token validity can predate the current time during the request.
+	NotBeforeValidationSkew uint64 `bson:"notBeforeValidationSkew,omitempty" json:"notBeforeValidationSkew,omitempty"`
+
+	// ExpiresAtValidationSkew contains the duration in seconds for which the token can be expired before we consider it expired.
+	ExpiresAtValidationSkew uint64 `bson:"expiresAtValidationSkew,omitempty" json:"expiresAtValidationSkew,omitempty"`
+
+	// IDPClientIDMappingDisabled prevents Tyk from automatically detecting the use of certain IDPs based on standard claims
+	// that they include in the JWT: `client_id`, `cid`, `clientId`. Setting this flag to `true` disables the mapping and avoids
+	// accidentally misidentifying the use of one of these IDPs if one of their standard values is configured in your JWT.
+	IDPClientIDMappingDisabled bool `bson:"idpClientIdMappingDisabled,omitempty" json:"idpClientIdMappingDisabled,omitempty"`
 }
 
 // Import populates *JWT based on arguments.
@@ -166,6 +217,7 @@ func (s *OAS) fillJWT(api apidef.APIDefinition) {
 	jwt.IssuedAtValidationSkew = api.JWTIssuedAtValidationSkew
 	jwt.NotBeforeValidationSkew = api.JWTNotBeforeValidationSkew
 	jwt.ExpiresAtValidationSkew = api.JWTExpiresAtValidationSkew
+	jwt.IDPClientIDMappingDisabled = api.IDPClientIDMappingDisabled
 
 	s.getTykSecuritySchemes()[ac.Name] = jwt
 
@@ -195,15 +247,17 @@ func (s *OAS) extractJWTTo(api *apidef.APIDefinition, name string) {
 	api.JWTIssuedAtValidationSkew = jwt.IssuedAtValidationSkew
 	api.JWTNotBeforeValidationSkew = jwt.NotBeforeValidationSkew
 	api.JWTExpiresAtValidationSkew = jwt.ExpiresAtValidationSkew
+	api.IDPClientIDMappingDisabled = jwt.IDPClientIDMappingDisabled
 
 	api.AuthConfigs[apidef.JWTType] = ac
 }
 
 // Basic type holds configuration values related to http basic authentication.
 type Basic struct {
-	// Enabled enables the basic authentication mode.
+	// Enabled activates the basic authentication mode.
 	// Tyk classic API definition: `use_basic_auth`
-	Enabled     bool `bson:"enabled" json:"enabled"` // required
+	Enabled bool `bson:"enabled" json:"enabled"` // required
+	// AuthSources contains the source for HTTP Basic Auth credentials.
 	AuthSources `bson:",inline" json:",inline"`
 	// DisableCaching disables the caching of basic authentication key.
 	// Tyk classic API definition: `basic_auth.disable_caching`
@@ -290,7 +344,7 @@ func (s *OAS) extractBasicTo(api *apidef.APIDefinition, name string) {
 
 // ExtractCredentialsFromBody configures extracting credentials from the request body.
 type ExtractCredentialsFromBody struct {
-	// Enabled enables extracting credentials from body.
+	// Enabled activates extracting credentials from body.
 	// Tyk classic API definition: `basic_auth.extract_from_body`
 	Enabled bool `bson:"enabled" json:"enabled"` // required
 	// UserRegexp is the regex for username e.g. `<User>(.*)</User>`.
@@ -317,12 +371,23 @@ func (e *ExtractCredentialsFromBody) ExtractTo(api *apidef.APIDefinition) {
 
 // OAuth configures the OAuth middleware.
 type OAuth struct {
-	Enabled               bool `bson:"enabled" json:"enabled"` // required
-	AuthSources           `bson:",inline" json:",inline"`
+	// Enabled activates the OAuth middleware.
+	Enabled bool `bson:"enabled" json:"enabled"` // required
+
+	// AuthSources configures the sources for OAuth credentials.
+	AuthSources `bson:",inline" json:",inline"`
+
+	// AllowedAuthorizeTypes is an array of OAuth authorization types.
 	AllowedAuthorizeTypes []osin.AuthorizeRequestType `bson:"allowedAuthorizeTypes,omitempty" json:"allowedAuthorizeTypes,omitempty"`
-	RefreshToken          bool                        `bson:"refreshToken,omitempty" json:"refreshToken,omitempty"`
-	AuthLoginRedirect     string                      `bson:"authLoginRedirect,omitempty" json:"authLoginRedirect,omitempty"`
-	Notifications         *Notifications              `bson:"notifications,omitempty" json:"notifications,omitempty"`
+
+	// RefreshToken enables clients using a refresh token to get a new bearer access token.
+	RefreshToken bool `bson:"refreshToken,omitempty" json:"refreshToken,omitempty"`
+
+	// AuthLoginRedirect configures a URL to redirect to after a successful login.
+	AuthLoginRedirect string `bson:"authLoginRedirect,omitempty" json:"authLoginRedirect,omitempty"`
+
+	// Notifications configures a URL trigger on key changes.
+	Notifications *Notifications `bson:"notifications,omitempty" json:"notifications,omitempty"`
 }
 
 // Import populates *OAuth from it's arguments.
@@ -395,28 +460,40 @@ func (s *OAS) extractOAuthTo(api *apidef.APIDefinition, name string) {
 	api.AuthConfigs[apidef.OAuthType] = authConfig
 }
 
+// OAuthProvider holds the configuration for validation and introspection of OAuth tokens.
 type OAuthProvider struct {
-	JWT           *JWTValidation `bson:"jwt,omitempty" json:"jwt,omitempty"`
+	// JWT configures JWT validation.
+	JWT *JWTValidation `bson:"jwt,omitempty" json:"jwt,omitempty"`
+	// Introspection configures token introspection.
 	Introspection *Introspection `bson:"introspection,omitempty" json:"introspection,omitempty"`
 }
 
+// JWTValidation holds configuration for validating access tokens by inspecing them
+// against a third party API, usually one provided by the IDP.
 type JWTValidation struct {
-	// Enabled enables OAuth access token validation by introspection to a third party.
+	// Enabled activates OAuth access token validation.
 	Enabled bool `bson:"enabled" json:"enabled"`
+
 	// SigningMethod to verify signing method used in jwt - allowed values HMAC/RSA/ECDSA.
 	SigningMethod string `bson:"signingMethod" json:"signingMethod"`
-	// Source is the secret to verify signature, it could be one among:
+
+	// Source is the secret to verify signature. Valid values are:
+	//
 	// - a base64 encoded static secret,
-	// - a valid JWK url in plain text,
-	// - a valid JWK url in base64 encoded format.
+	// - a valid JWK URL in plain text,
+	// - a valid JWK URL in base64 encoded format.
 	Source string `bson:"source" json:"source"`
+
 	// IdentityBaseField is the identity claim name.
 	IdentityBaseField string `bson:"identityBaseField,omitempty" json:"identityBaseField,omitempty"`
-	// IssuedAtValidationSkew is the clock skew to be considered while validating iat claim.
+
+	// IssuedAtValidationSkew is the clock skew to be considered while validating the iat claim.
 	IssuedAtValidationSkew uint64 `bson:"issuedAtValidationSkew,omitempty" json:"issuedAtValidationSkew,omitempty"`
-	// NotBeforeValidationSkew is the clock skew to be considered while validating nbf claim.
+
+	// NotBeforeValidationSkew is the clock skew to be considered while validating the nbf claim.
 	NotBeforeValidationSkew uint64 `bson:"notBeforeValidationSkew,omitempty" json:"notBeforeValidationSkew,omitempty"`
-	// ExpiresAtValidationSkew is the clock skew to be considered while validating exp claim.
+
+	// ExpiresAtValidationSkew is the clock skew to be considered while validating the exp claim.
 	ExpiresAtValidationSkew uint64 `bson:"expiresAtValidationSkew,omitempty" json:"expiresAtValidationSkew,omitempty"`
 }
 
@@ -440,19 +517,20 @@ func (j *JWTValidation) ExtractTo(jwt *apidef.JWTValidation) {
 	jwt.ExpiresAtValidationSkew = j.ExpiresAtValidationSkew
 }
 
+// Introspection holds configuration for OAuth token introspection.
 type Introspection struct {
-	// Enabled enables OAuth access token validation by introspection to a third party.
+	// Enabled activates OAuth access token validation by introspection to a third party.
 	Enabled bool `bson:"enabled" json:"enabled"`
 	// URL is the URL of the third party provider's introspection endpoint.
 	URL string `bson:"url" json:"url"`
 	// ClientID is the public identifier for the client, acquired from the third party.
 	ClientID string `bson:"clientId" json:"clientId"`
-	// ClientSecret is a secret known only to the client and the authorization server, acquired from the third party.
+	// ClientSecret is a secret known only to the client and the authorisation server, acquired from the third party.
 	ClientSecret string `bson:"clientSecret" json:"clientSecret"`
 	// IdentityBaseField is the key showing where to find the user id in the claims. If it is empty, the `sub` key is looked at.
 	IdentityBaseField string `bson:"identityBaseField,omitempty" json:"identityBaseField,omitempty"`
 	// Cache is the caching mechanism for introspection responses.
-	Cache *IntrospectionCache `bson:"cache" json:"cache"`
+	Cache *IntrospectionCache `bson:"cache,omitempty" json:"cache,omitempty"`
 }
 
 func (i *Introspection) Fill(intros apidef.Introspection) {
@@ -484,8 +562,9 @@ func (i *Introspection) ExtractTo(intros *apidef.Introspection) {
 	}
 }
 
+// IntrospectionCache holds configuration for caching introspection requests.
 type IntrospectionCache struct {
-	// Enabled enables the caching mechanism for introspection responses.
+	// Enabled activates the caching mechanism for introspection responses.
 	Enabled bool `bson:"enabled" json:"enabled"`
 	// Timeout is the duration in seconds of how long the cached value stays.
 	// For introspection caching, it is suggested to use a short interval.
@@ -502,10 +581,19 @@ func (c *IntrospectionCache) ExtractTo(cache *apidef.IntrospectionCache) {
 	cache.Timeout = c.Timeout
 }
 
+// ExternalOAuth holds configuration for an external OAuth provider.
+// ExternalOAuth support will be deprecated starting from 5.7.0.
+// To avoid any disruptions, we recommend that you use JSON Web Token (JWT) instead,
+// as explained in https://tyk.io/docs/basic-config-and-security/security/authentication-authorization/ext-oauth-middleware/.
 type ExternalOAuth struct {
-	Enabled     bool `bson:"enabled" json:"enabled"` // required
+	// Enabled activates external oauth functionality.
+	Enabled bool `bson:"enabled" json:"enabled"` // required
+
+	// AuthSources configures the source for the authentication token.
 	AuthSources `bson:",inline" json:",inline"`
-	Providers   []OAuthProvider `bson:"providers" json:"providers"` // required
+
+	// Providers is used to configure OAuth providers.
+	Providers []OAuthProvider `bson:"providers" json:"providers"` // required
 }
 
 func (s *OAS) fillExternalOAuth(api apidef.APIDefinition) {
@@ -633,12 +721,16 @@ func (s *OAS) fillSecurity(api apidef.APIDefinition) {
 }
 
 func (s *OAS) extractSecurityTo(api *apidef.APIDefinition) {
-	if tykAuthentication := s.getTykAuthentication(); tykAuthentication != nil {
-		tykAuthentication.ExtractTo(api)
-	} else {
-		api.UseKeylessAccess = true
-		return
+	if s.getTykAuthentication() == nil {
+		s.GetTykExtension().Server.Authentication = &Authentication{}
+		defer func() {
+			s.GetTykExtension().Server.Authentication = nil
+		}()
 	}
+
+	resetSecuritySchemes(api)
+
+	s.getTykAuthentication().ExtractTo(api)
 
 	if api.AuthConfigs == nil {
 		api.AuthConfigs = make(map[string]apidef.AuthConfig)
@@ -679,6 +771,61 @@ func (s *OAS) extractSecurityTo(api *apidef.APIDefinition) {
 			}
 		}
 	}
+}
+
+func resetSecuritySchemes(api *apidef.APIDefinition) {
+	api.AuthConfigs = nil
+
+	// OAuth2
+	api.UseOauth2 = false
+	api.Oauth2Meta.AllowedAccessTypes = nil
+	api.Oauth2Meta.AllowedAuthorizeTypes = nil
+	api.Oauth2Meta.AuthorizeLoginRedirect = ""
+	api.NotificationsDetails = apidef.NotificationsManager{}
+
+	// External OAuth
+	api.ExternalOAuth = apidef.ExternalOAuth{}
+
+	// OIDC
+	api.UseOpenID = false
+	api.Scopes.OIDC = apidef.ScopeClaim{}
+	api.OpenIDOptions = apidef.OpenIDOptions{}
+
+	// Basic
+	api.UseBasicAuth = false
+	api.BasicAuth.DisableCaching = false
+	api.BasicAuth.CacheTTL = 0
+	api.BasicAuth.ExtractFromBody = false
+	api.BasicAuth.BodyUserRegexp = ""
+	api.BasicAuth.BodyPasswordRegexp = ""
+	delete(api.AuthConfigs, "basic")
+
+	// HMAC
+	api.EnableSignatureChecking = false
+	api.HmacAllowedClockSkew = 0
+	api.HmacAllowedAlgorithms = nil
+
+	// JWT
+	api.EnableJWT = false
+	api.JWTSource = ""
+	api.JWTSigningMethod = ""
+	api.JWTIdentityBaseField = ""
+	api.JWTSkipKid = false
+	api.JWTPolicyFieldName = ""
+	api.JWTClientIDBaseField = ""
+	api.Scopes.JWT = apidef.ScopeClaim{}
+	api.JWTDefaultPolicies = nil
+	api.JWTIssuedAtValidationSkew = 0
+	api.JWTExpiresAtValidationSkew = 0
+	api.JWTNotBeforeValidationSkew = 0
+
+	// Auth Token
+	api.UseStandardAuth = false
+
+	// Custom
+	api.CustomPluginAuthEnabled = false
+	api.CustomMiddleware.AuthCheck = apidef.MiddlewareDefinition{Disabled: true}
+	api.CustomMiddleware.IdExtractor = apidef.MiddlewareIdExtractor{Disabled: true}
 }
 
 func (s *OAS) fillAPIKeyScheme(ac *apidef.AuthConfig) {

@@ -48,6 +48,16 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 					Active: true,
 				},
 			},
+			Middleware: &Middleware{
+				Global: &Global{
+					TrafficLogs: &TrafficLogs{
+						Enabled: true,
+					},
+					ContextVariables: &ContextVariables{
+						Enabled: true,
+					},
+				},
+			},
 		}
 
 		assert.Equal(t, expectedTykExtension, *oasDef.GetTykExtension())
@@ -94,6 +104,16 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 				Name: "OAS API",
 				State: State{
 					Active: true,
+				},
+			},
+			Middleware: &Middleware{
+				Global: &Global{
+					TrafficLogs: &TrafficLogs{
+						Enabled: true,
+					},
+					ContextVariables: &ContextVariables{
+						Enabled: true,
+					},
 				},
 			},
 		}
@@ -147,6 +167,16 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 					Active: true,
 				},
 			},
+			Middleware: &Middleware{
+				Global: &Global{
+					TrafficLogs: &TrafficLogs{
+						Enabled: true,
+					},
+					ContextVariables: &ContextVariables{
+						Enabled: true,
+					},
+				},
+			},
 		}
 
 		assert.Equal(t, expectedTykExtension, *oasDef.GetTykExtension())
@@ -198,13 +228,13 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 					Value: "/listen-api",
 					Strip: true,
 				},
-				CustomDomain: &Domain{true, "custom-domain.org"},
+				CustomDomain: &Domain{Enabled: true, Name: "custom-domain.org"},
 			},
 		}
 
 		oasDef.SetTykExtension(&existingTykExtension)
 
-		newCustomDomain := &Domain{true, "new-custom-domain.org"}
+		newCustomDomain := &Domain{Enabled: true, Name: "new-custom-domain.org"}
 
 		err := oasDef.BuildDefaultTykExtension(TykExtensionConfigParams{
 			ListenPath:     "/new-listen-api",
@@ -253,6 +283,16 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 				Name: "New OAS API",
 				State: State{
 					Active: true,
+				},
+			},
+			Middleware: &Middleware{
+				Global: &Global{
+					TrafficLogs: &TrafficLogs{
+						Enabled: true,
+					},
+					ContextVariables: &ContextVariables{
+						Enabled: true,
+					},
 				},
 			},
 		}
@@ -961,7 +1001,92 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 					err := oasDef.BuildDefaultTykExtension(tykExtensionConfigParams, true)
 
 					assert.NoError(t, err)
-					assert.Nil(t, oasDef.GetTykExtension().Middleware)
+					assert.Equal(t, &Middleware{
+						Global: &Global{
+							TrafficLogs: &TrafficLogs{
+								Enabled: true,
+							},
+							ContextVariables: &ContextVariables{
+								Enabled: true,
+							},
+						},
+						Operations: Operations{},
+					}, oasDef.GetTykExtension().Middleware)
+				})
+
+			t.Run("configure validateRequest when OAS request parameters are configured on path level",
+				func(t *testing.T) {
+					oasDef := getOASDef(true, false)
+					petsPathItem := oasDef.Paths.Find("/pets")
+					petsPathItem.Parameters = openapi3.Parameters{
+						{
+							Value: &openapi3.Parameter{
+								Name: "auth",
+								In:   header,
+								Schema: &openapi3.SchemaRef{
+									Value: &openapi3.Schema{
+										Type: "string",
+									},
+								},
+							},
+						},
+					}
+
+					t.Run("import=true,validateRequest=enabled", func(t *testing.T) {
+						tykExtensionConfigParams := TykExtensionConfigParams{
+							ValidateRequest: &trueVal,
+						}
+
+						err := oasDef.BuildDefaultTykExtension(tykExtensionConfigParams, true)
+
+						assert.NoError(t, err)
+
+						expectedOperations := getExpectedOperations(true, true, middlewareValidateRequest)
+						expectedOperations[oasGetOperationID] = expectedOperations[oasPostOperationID]
+						assert.Equal(t, expectedOperations, oasDef.GetTykExtension().Middleware.Operations)
+					})
+
+					t.Run("import=true,validateRequest=disabled", func(t *testing.T) {
+						tykExtensionConfigParams := TykExtensionConfigParams{
+							ValidateRequest: &falseVal,
+						}
+
+						err := oasDef.BuildDefaultTykExtension(tykExtensionConfigParams, true)
+
+						assert.NoError(t, err)
+
+						expectedOperations := getExpectedOperations(false, true, middlewareValidateRequest)
+						expectedOperations[oasGetOperationID] = expectedOperations[oasPostOperationID]
+						assert.Equal(t, expectedOperations, oasDef.GetTykExtension().Middleware.Operations)
+					})
+
+					t.Run("import=false,validateRequest=enabled", func(t *testing.T) {
+						tykExtensionConfigParams := TykExtensionConfigParams{
+							ValidateRequest: &trueVal,
+						}
+
+						err := oasDef.BuildDefaultTykExtension(tykExtensionConfigParams, false)
+
+						assert.NoError(t, err)
+
+						expectedOperations := getExpectedOperations(true, true, middlewareValidateRequest)
+						expectedOperations[oasGetOperationID] = expectedOperations[oasPostOperationID]
+						assert.Equal(t, expectedOperations, oasDef.GetTykExtension().Middleware.Operations)
+					})
+
+					t.Run("import=false,validateRequest=disabled", func(t *testing.T) {
+						tykExtensionConfigParams := TykExtensionConfigParams{
+							ValidateRequest: &falseVal,
+						}
+
+						err := oasDef.BuildDefaultTykExtension(tykExtensionConfigParams, false)
+
+						assert.NoError(t, err)
+
+						expectedOperations := getExpectedOperations(false, true, middlewareValidateRequest)
+						expectedOperations[oasGetOperationID] = expectedOperations[oasPostOperationID]
+						assert.Equal(t, expectedOperations, oasDef.GetTykExtension().Middleware.Operations)
+					})
 				})
 		})
 
@@ -975,7 +1100,17 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 				err := oasDef.BuildDefaultTykExtension(tykExtensionConfigParams, true)
 
 				assert.NoError(t, err)
-				assert.Nil(t, oasDef.GetTykExtension().Middleware)
+				assert.Equal(t, &Middleware{
+					Global: &Global{
+						TrafficLogs: &TrafficLogs{
+							Enabled: true,
+						},
+						ContextVariables: &ContextVariables{
+							Enabled: true,
+						},
+					},
+					Operations: Operations{},
+				}, oasDef.GetTykExtension().Middleware)
 			})
 
 			t.Run("do not configure MockResponse if no valid examples/example/schema found but configured response",
@@ -998,7 +1133,17 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 					err := oasDef.BuildDefaultTykExtension(tykExtensionConfigParams, true)
 
 					assert.NoError(t, err)
-					assert.Nil(t, oasDef.GetTykExtension().Middleware)
+					assert.Equal(t, &Middleware{
+						Global: &Global{
+							TrafficLogs: &TrafficLogs{
+								Enabled: true,
+							},
+							ContextVariables: &ContextVariables{
+								Enabled: true,
+							},
+						},
+						Operations: Operations{},
+					}, oasDef.GetTykExtension().Middleware)
 				})
 
 			t.Run("enable oasMockResponse for all paths when operationID is configured in OAS with valid examples in response",
@@ -1201,6 +1346,16 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 		expectedTykExtension := existingTykExtension
 		expectedTykExtension.Server.ListenPath.Value = newListenPath
 		expectedTykExtension.Info.State.Active = true
+		expectedTykExtension.Middleware = &Middleware{
+			Global: &Global{
+				TrafficLogs: &TrafficLogs{
+					Enabled: true,
+				},
+				ContextVariables: &ContextVariables{
+					Enabled: true,
+				},
+			},
+		}
 
 		err := oasDef.BuildDefaultTykExtension(TykExtensionConfigParams{
 			ListenPath: newListenPath,
@@ -1246,6 +1401,105 @@ func TestOAS_BuildDefaultTykExtension(t *testing.T) {
 		}
 
 		assert.Equal(t, expectedTykExtension, *oasDef.GetTykExtension())
+	})
+
+	t.Run("build tyk-extension should overwrite upstream url params with defaults values", func(t *testing.T) {
+		oasDef := OAS{
+			T: openapi3.T{
+				Info: &openapi3.Info{
+					Title: "OAS API",
+				},
+				Servers: openapi3.Servers{
+					{
+						URL: "https://example-org.com/api/{bestApiGateway}",
+						Variables: map[string]*openapi3.ServerVariable{
+							"bestApiGateway": {
+								Default: "tyk",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := oasDef.BuildDefaultTykExtension(TykExtensionConfigParams{}, true)
+		assert.NoError(t, err)
+
+		expectedTykExtension := XTykAPIGateway{
+			Server: Server{
+				ListenPath: ListenPath{
+					Value: "/",
+					Strip: true,
+				},
+			},
+			Upstream: Upstream{
+				URL: "https://example-org.com/api/tyk",
+			},
+			Info: Info{
+				Name: "OAS API",
+				State: State{
+					Active: true,
+				},
+			},
+			Middleware: &Middleware{
+				Global: &Global{
+					TrafficLogs: &TrafficLogs{
+						Enabled: true,
+					},
+					ContextVariables: &ContextVariables{
+						Enabled: true,
+					},
+				},
+			},
+		}
+
+		assert.Equal(t, expectedTykExtension, *oasDef.GetTykExtension())
+	})
+
+	t.Run("build tyk-extension should error when a parameter does not have a default value", func(t *testing.T) {
+		oasDef := OAS{
+			T: openapi3.T{
+				Info: &openapi3.Info{
+					Title: "OAS API",
+				},
+				Servers: openapi3.Servers{
+					{
+						URL: "https://example-org.com/api/{bestApiGateway}",
+						Variables: map[string]*openapi3.ServerVariable{
+							"bestApiGateway": {},
+						},
+					},
+				},
+			},
+		}
+
+		err := oasDef.BuildDefaultTykExtension(TykExtensionConfigParams{}, true)
+		assert.NotNil(t, err)
+		assert.Contains(t, err.Error(), "does not have a default value")
+	})
+
+	t.Run("build tyk-extension should error when url still contains parameters after replacing is done", func(t *testing.T) {
+		oasDef := OAS{
+			T: openapi3.T{
+				Info: &openapi3.Info{
+					Title: "OAS API",
+				},
+				Servers: openapi3.Servers{
+					{
+						URL: "https://example-org.com/api/{bestApiGateway}/{extraParam}",
+						Variables: map[string]*openapi3.ServerVariable{
+							"bestApiGateway": {
+								Default: "tyk",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := oasDef.BuildDefaultTykExtension(TykExtensionConfigParams{}, true)
+		assert.NotNil(t, err)
+		assert.Contains(t, err.Error(), "server URL contains undefined variables")
 	})
 }
 
@@ -1367,6 +1621,7 @@ func TestOAS_importAuthentication(t *testing.T) {
 
 	t.Run("add first authentication in case of OR condition", func(t *testing.T) {
 		check := func(t *testing.T, enable bool) {
+			t.Helper()
 			oas := OAS{}
 			oas.Security = openapi3.SecurityRequirements{
 				{testSecurityNameToken: []string{}},
@@ -1493,6 +1748,7 @@ func TestOAS_importAuthentication(t *testing.T) {
 
 	t.Run("add multiple authentication with AND condition", func(t *testing.T) {
 		check := func(t *testing.T, enable bool) {
+			t.Helper()
 			oas := OAS{}
 			oas.Security = openapi3.SecurityRequirements{
 				{testSecurityNameToken: []string{}, testSecurityNameJWT: []string{}},
@@ -1575,6 +1831,7 @@ func TestSecuritySchemes_Import(t *testing.T) {
 
 	t.Run("token", func(t *testing.T) {
 		check := func(t *testing.T, enable bool) {
+			t.Helper()
 			securitySchemes := SecuritySchemes{}
 			nativeSecurityScheme := &openapi3.SecurityScheme{
 				Type: typeAPIKey,

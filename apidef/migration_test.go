@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/TykTechnologies/tyk/internal/event"
 )
 
 const (
@@ -26,11 +28,31 @@ var testV1ExtendedPaths = ExtendedPathsSet{
 	WhiteList: []EndPointMeta{
 		{Method: http.MethodGet, Path: "/get1"},
 	},
+	TransformResponse: []TemplateMeta{
+		{
+			Method: http.MethodGet, Path: "/transform1",
+			TemplateData: TemplateData{
+				EnableSession:  true,
+				Mode:           UseBlob,
+				TemplateSource: `{"http_method":"{{.Method}}"}`,
+				Input:          RequestJSON,
+			}},
+	},
 }
 
 var testV2ExtendedPaths = ExtendedPathsSet{
 	WhiteList: []EndPointMeta{
 		{Method: http.MethodGet, Path: "/get2"},
+	},
+	TransformResponse: []TemplateMeta{
+		{
+			Method: http.MethodGet, Path: "/transform2",
+			TemplateData: TemplateData{
+				EnableSession:  true,
+				Mode:           UseBlob,
+				TemplateSource: `{"http_method":"{{.Method}}"}`,
+				Input:          RequestJSON,
+			}},
 	},
 }
 
@@ -99,6 +121,9 @@ func oldTestAPI() APIDefinition {
 				UseCookie:      true,
 				CookieName:     "Authorization",
 			},
+		},
+		ResponseProcessors: []ResponseProcessor{
+			{Name: ResponseProcessorResponseBodyTransform},
 		},
 	}
 }
@@ -326,6 +351,7 @@ func TestAPIDefinition_MigrateVersioning_StripPath(t *testing.T) {
 	}
 
 	check := func(t *testing.T, base APIDefinition, stripVersioningData bool) {
+		t.Helper()
 		versions, err := base.MigrateVersioning()
 		assert.NoError(t, err)
 
@@ -596,8 +622,20 @@ func TestSetDisabledFlags(t *testing.T) {
 			Versions: map[string]VersionInfo{
 				"": {
 					ExtendedPaths: ExtendedPathsSet{
-						Virtual:  make([]VirtualMeta, 1),
+						Virtual:  make([]VirtualMeta, 2),
 						GoPlugin: make([]GoPluginMeta, 1),
+					},
+				},
+			},
+		},
+		EventHandlers: EventHandlerMetaConfig{
+			Events: map[TykEvent][]EventHandlerTriggerConfig{
+				event.QuotaExceeded: {
+					{
+						Handler: event.WebHookHandler,
+						HandlerMeta: map[string]interface{}{
+							"target_path": "https://webhook.site/uuid",
+						},
 					},
 				},
 			},
@@ -658,6 +696,9 @@ func TestSetDisabledFlags(t *testing.T) {
 							{
 								Disabled: true,
 							},
+							{
+								Disabled: true,
+							},
 						},
 						GoPlugin: []GoPluginMeta{
 							{
@@ -668,9 +709,27 @@ func TestSetDisabledFlags(t *testing.T) {
 				},
 			},
 		},
+		GlobalRateLimit: GlobalRateLimit{
+			Disabled: true,
+		},
+		EventHandlers: EventHandlerMetaConfig{
+			Events: map[event.Event][]EventHandlerTriggerConfig{
+				event.QuotaExceeded: {
+					{
+						Handler: event.WebHookHandler,
+						HandlerMeta: map[string]interface{}{
+							"target_path": "https://webhook.site/uuid",
+							"disabled":    true,
+						},
+					},
+				},
+			},
+		},
+		DoNotTrack: true,
 	}
 	apiDef.SetDisabledFlags()
 	assert.Equal(t, expectedAPIDef, apiDef)
+	assert.EqualValues(t, expectedAPIDef.EventHandlers, apiDef.EventHandlers)
 }
 
 func TestAPIDefinition_migrateIDExtractor(t *testing.T) {
@@ -728,6 +787,127 @@ func TestAPIDefinition_migrateScopeToPolicy(t *testing.T) {
 		_, err := apiDef.Migrate()
 		assert.NoError(t, err)
 		check(t, apiDef.JWTScopeClaimName, apiDef.JWTScopeToPolicyMapping, apiDef.Scopes.OIDC)
+	})
+
+}
+
+func TestAPIDefinition_migrateResponseProcessors(t *testing.T) {
+	base := oldTestAPI()
+	_, err := base.Migrate()
+	assert.NoError(t, err)
+
+	assert.Empty(t, base.ResponseProcessors)
+}
+
+func TestAPIDefinition_migrateGlobalRateLimit(t *testing.T) {
+	t.Run("per=0,rate=0", func(t *testing.T) {
+		base := oldTestAPI()
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.True(t, base.GlobalRateLimit.Disabled)
+	})
+
+	t.Run("per!=0,rate=0", func(t *testing.T) {
+		base := oldTestAPI()
+		base.GlobalRateLimit.Per = 120
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.True(t, base.GlobalRateLimit.Disabled)
+	})
+
+	t.Run("per=0,rate!=0", func(t *testing.T) {
+		base := oldTestAPI()
+		base.GlobalRateLimit.Rate = 1
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.True(t, base.GlobalRateLimit.Disabled)
+	})
+
+	t.Run("per!=0,rate!=0", func(t *testing.T) {
+		base := oldTestAPI()
+		base.GlobalRateLimit.Rate = 1
+		base.GlobalRateLimit.Per = 1
+		_, err := base.Migrate()
+		assert.NoError(t, err)
+
+		assert.False(t, base.GlobalRateLimit.Disabled)
+	})
+}
+
+func TestAPIDefinition_migrateIPAccessControl(t *testing.T) {
+	t.Run("whitelisting", func(t *testing.T) {
+		t.Run("EnableIpWhitelisting=true, no whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = true
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("IPWhiteListEnabled=true, non-empty whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = true
+			base.AllowedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.False(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("EnableIpWhitelisting=false, no whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = false
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("IPWhiteListEnabled=false, non-empty whitelist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpWhiteListing = false
+			base.AllowedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+	})
+
+	t.Run("blacklisting", func(t *testing.T) {
+		t.Run("EnableIpBlacklisting=true, no blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = true
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("EnableIpBlacklisting=true, non-empty blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = true
+			base.BlacklistedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.False(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("EnableIpBlacklisting=false, no blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = false
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
+
+		t.Run("IPWhiteListEnabled=false, non-empty blacklist", func(t *testing.T) {
+			base := oldTestAPI()
+			base.EnableIpBlacklisting = false
+			base.BlacklistedIPs = []string{"127.0.0.1"}
+			_, err := base.Migrate()
+			assert.NoError(t, err)
+			assert.True(t, base.IPAccessControlDisabled)
+		})
 	})
 
 }

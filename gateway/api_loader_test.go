@@ -1,23 +1,27 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"path"
 	_ "path"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
-	"github.com/TykTechnologies/storage/persistent/model"
-	"github.com/TykTechnologies/tyk/apidef"
-
 	"github.com/stretchr/testify/assert"
 
+	persistentmodel "github.com/TykTechnologies/storage/persistent/model"
+	"github.com/TykTechnologies/tyk/apidef"
+	"github.com/TykTechnologies/tyk/config"
+	"github.com/TykTechnologies/tyk/internal/uuid"
 	"github.com/TykTechnologies/tyk/test"
 	"github.com/TykTechnologies/tyk/trace"
 	"github.com/TykTechnologies/tyk/user"
-
-	"github.com/TykTechnologies/tyk/internal/uuid"
 )
 
 func TestOpenTracing(t *testing.T) {
@@ -95,7 +99,7 @@ func TestFuzzyFindAPI(t *testing.T) {
 	ts := StartTest(nil)
 	defer ts.Close()
 
-	objectId := model.NewObjectID()
+	objectId := persistentmodel.NewObjectID()
 
 	ts.Gw.BuildAndLoadAPI(
 		func(spec *APISpec) {
@@ -184,6 +188,7 @@ func TestGraphQLPlayground(t *testing.T) {
 	})[0]
 
 	run := func(t *testing.T, playgroundPath string, api *APISpec, env string) {
+		t.Helper()
 		endpoint := api.Proxy.ListenPath
 		if env == "cloud" {
 			endpoint = fmt.Sprintf("/%s/", api.Slug)
@@ -425,4 +430,9090 @@ func TestAllApisAreMTLS(t *testing.T) {
 	if result != expected {
 		t.Errorf("Expected AllApisAreMTLS to return %v, but got %v", expected, result)
 	}
+}
+
+func TestOpenTelemetry(t *testing.T) {
+	t.Run("Opentelemetry enabled - check if we are sending traces", func(t *testing.T) {
+		otelCollectorMock := httpCollectorMock(t, func(w http.ResponseWriter, r *http.Request) {
+			//check the body
+			body, err := io.ReadAll(r.Body)
+			assert.Nil(t, err)
+
+			assert.NotEmpty(t, body)
+
+			// check the user agent
+			agent, ok := r.Header["User-Agent"]
+			assert.True(t, ok)
+			assert.Len(t, agent, 1)
+			assert.Contains(t, agent[0], "OTLP")
+
+			//check if we are sending the traces to the right endpoint
+			assert.Contains(t, r.URL.Path, "/v1/traces")
+
+			// Here you can check the request and return a response
+			w.WriteHeader(http.StatusOK)
+		}, ":0")
+
+		// Start the server.
+		otelCollectorMock.Start()
+		// Stop the server on return from the function.
+		defer otelCollectorMock.Close()
+
+		ts := StartTest(func(globalConf *config.Config) {
+			globalConf.OpenTelemetry.Enabled = true
+			globalConf.OpenTelemetry.Exporter = "http"
+			globalConf.OpenTelemetry.Endpoint = otelCollectorMock.URL
+			globalConf.OpenTelemetry.SpanProcessorType = "simple"
+		})
+		defer ts.Close()
+		detailedTracing := []bool{true, false}
+		for _, detailed := range detailedTracing {
+			ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+				spec.APIID = "test"
+				spec.Proxy.ListenPath = "/my-api/"
+				spec.UseKeylessAccess = true
+				spec.DetailedTracing = detailed
+			})
+
+			response, _ := ts.Run(t, test.TestCase{Path: "/my-api/", Code: http.StatusOK})
+			assert.NotEmpty(t, response.Header.Get("X-Tyk-Trace-Id"))
+			assert.Equal(t, "otel", ts.Gw.TracerProvider.Type())
+		}
+
+	})
+
+	t.Run("Opentelemetry disabled - check if we are not sending traces", func(t *testing.T) {
+
+		otelCollectorMock := httpCollectorMock(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Fail()
+		}, ":0")
+
+		// Start the server.
+		otelCollectorMock.Start()
+		// Stop the server on return from the function.
+		defer otelCollectorMock.Close()
+
+		ts := StartTest(func(globalConf *config.Config) {
+			globalConf.OpenTelemetry.Enabled = false
+			globalConf.OpenTelemetry.Exporter = "http"
+			globalConf.OpenTelemetry.Endpoint = otelCollectorMock.URL
+			globalConf.OpenTelemetry.SpanProcessorType = "simple"
+		})
+		defer ts.Close()
+
+		ts.Gw.BuildAndLoadAPI(func(spec *APISpec) {
+			spec.APIID = "test"
+			spec.Proxy.ListenPath = "/my-api/"
+			spec.UseKeylessAccess = true
+		})
+
+		response, _ := ts.Run(t, test.TestCase{Path: "/my-api/", Code: http.StatusOK})
+		assert.Empty(t, response.Header.Get("X-Tyk-Trace-Id"))
+		assert.Equal(t, "noop", ts.Gw.TracerProvider.Type())
+	})
+}
+
+func httpCollectorMock(t *testing.T, fn http.HandlerFunc, address string) *httptest.Server {
+	t.Helper()
+
+	l, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("error setting up collector mock: %s", err.Error())
+	}
+
+	otelCollectorMock := httptest.NewUnstartedServer(fn)
+	// NewUnstartedServer creates a listener. Close that listener and replace
+	// with the one we created.
+	otelCollectorMock.Listener.Close()
+	otelCollectorMock.Listener = l
+
+	return otelCollectorMock
+}
+
+func TestConfigureAuthAndOrgStores(t *testing.T) {
+
+	testCases := []struct {
+		name                 string
+		storageEngine        apidef.StorageEngineCode
+		expectedAuthStore    string
+		expectedOrgStore     string
+		expectedSessionStore string
+		configureGateway     func(gw *Gateway)
+	}{
+		{
+			name:                 "LDAP Storage Engine",
+			storageEngine:        LDAPStorageEngine,
+			expectedAuthStore:    "*gateway.LDAPStorageHandler",
+			expectedOrgStore:     "*storage.RedisCluster",
+			expectedSessionStore: "*storage.RedisCluster",
+			configureGateway: func(gw *Gateway) {
+			},
+		}, {
+			name:                 "RPC Storage engine",
+			storageEngine:        RPCStorageEngine,
+			expectedAuthStore:    "*gateway.RPCStorageHandler",
+			expectedOrgStore:     "*storage.MdcbStorage",
+			expectedSessionStore: "*gateway.RPCStorageHandler",
+			configureGateway: func(gw *Gateway) {
+				conf := gw.GetConfig()
+				conf.SlaveOptions.UseRPC = true
+				gw.SetConfig(conf, true)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := NewGateway(config.Config{}, context.Background())
+			tc.configureGateway(gw)
+			gs := gw.prepareStorage()
+
+			spec := BuildAPI(func(spec *APISpec) {
+				spec.AuthProvider.StorageEngine = tc.storageEngine
+
+				if tc.storageEngine == RPCStorageEngine {
+					spec.SessionProvider.StorageEngine = RPCStorageEngine
+				}
+
+				if tc.storageEngine == LDAPStorageEngine {
+					// populate ldap meta
+					meta := map[string]interface{}{
+						"ldap_server":            "dummy-ldap-server",
+						"ldap_port":              389.0,
+						"base_dn":                "base-dn",
+						"attributes":             []interface{}{"attr1", "attr2", "attr3"},
+						"session_attribute_name": "attr-name",
+						"search_string":          "the-search",
+					}
+					spec.AuthProvider.Meta = meta
+				}
+			})
+
+			// Call configureAuthAndOrgStores
+			authStore, orgStore, sessionStore := gw.configureAuthAndOrgStores(&gs, spec[0])
+
+			if reflect.TypeOf(authStore).String() != tc.expectedAuthStore {
+				t.Errorf("Expected authStore type %s, got %s", tc.expectedAuthStore, reflect.TypeOf(authStore).String())
+			}
+			if reflect.TypeOf(orgStore).String() != tc.expectedOrgStore {
+				t.Errorf("Expected orgStore type %s, got %s", tc.expectedOrgStore, reflect.TypeOf(orgStore).String())
+			}
+			if reflect.TypeOf(sessionStore).String() != tc.expectedSessionStore {
+				t.Errorf("Expected sessionStore type %s, got %s", tc.expectedSessionStore, reflect.TypeOf(sessionStore).String())
+			}
+		})
+	}
+}
+
+// section A - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomain(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section A - end
+
+// section B - start
+
+func TestLongerListenPathHasLongerDomainThanSubstringListenPath(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all httpserver options true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// section B - end
+
+// section C - start
+func TestIdenticalDomainsWithRegex(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section C - end
+
+// section D - start
+func TestIdenticalDomains(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section D - end
+
+// section E - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomainAndListenPathsEndInSlash(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section E - end
+
+// extra - start
+func TestDifferentDomainsIdenticalListenPaths(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+func TestDifferentDomainsWithOneListenPathBeingASubstringOfTheOther(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// extra - end
+
+// enable strip slash section (disable strip slash == false) - start
+
+// section A2 - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomainWithStripSlashEnabled(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section A2 - end
+
+// section B2 - start
+
+func TestLongerListenPathHasLongerDomainThanSubstringListenPathWithStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all httpserver options true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// section B2 - end
+
+// section C2 - start
+func TestIdenticalDomainsWithRegexWithStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section C2 - end
+
+// section D2 - start
+func TestIdenticalDomainsWithStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section D2 - end
+
+// section E2 - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomainAndListenPathsEndInSlashWithStripSlashEnabled(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section E2 - end
+
+// extra2 - start
+func TestDifferentDomainsIdenticalListenPathsWithStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+func TestDifferentDomainsWithOneListenPathBeingASubstringOfTheOtherWithStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// extra2 - end
+
+// enable strip slash section (disable strip slash == false) - end
+
+// 3rd section -- start
+
+// disable strip listenpath section (strip listen path == false) - start
+
+// section A3 - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomainWithStripListenPathDisabled(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section A3 - end
+
+// section B3 - start
+
+func TestLongerListenPathHasLongerDomainThanSubstringListenPathWithStripListenPathDisabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all httpserver options true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// section B3 - end
+
+// section C3 - start
+func TestIdenticalDomainsWithRegexWithStripListenPathDisabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section C3 - end
+
+// section D3 - start
+func TestIdenticalDomainsWithStripListenPathDisabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section D3 - end
+
+// section E3 - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomainAndListenPathsEndInSlashWithStripListenPathDisabled(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section E3 - end
+
+// extra3 - start
+func TestDifferentDomainsIdenticalListenPathsWithStripListenPathDisabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+func TestDifferentDomainsWithOneListenPathBeingASubstringOfTheOtherWithStripListenPathDisabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// extra3 - end
+
+// disable strip listenpath section (strip listen path == false) ) - end
+
+// 3rd section -- end
+
+// 4th section --start
+// enable strip slash and disable strip listenpath section (both DisableStripSlash and  StripListenPath set to false) - start
+
+// section A4 - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomainWithStripListenPathDisabledAndStripSlashEnabled(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = false
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section A4 - end
+
+// section B4 - start
+
+func TestLongerListenPathHasLongerDomainThanSubstringListenPathWithStripListenPathDisabledAndStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all httpserver options true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// section B4 - end
+
+// section C4 - start
+func TestIdenticalDomainsWithRegexWithStripListenPathDisabledAndStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section C4 - end
+
+// section D4 - start
+func TestIdenticalDomainsWithStripListenPathDisabledAndStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section D4 - end
+
+// section E4 - start
+func TestAPIsHavingShorterSubstringListenPathButLongerCustomDomainAndListenPathsEndInSlashWithStripListenPathDisabledAndStripSlashEnabled(t *testing.T) { //the case that triggered the critical from TT-12873
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic/"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "{subdomain:tyktest.io|abc.def.ghi}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended/"
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic/", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended/", Domain: "tyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+}
+
+// section E4 - end
+
+// extra4 - start
+func TestDifferentDomainsIdenticalListenPathsWithStripListenPathDisabledAndStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+func TestDifferentDomainsWithOneListenPathBeingASubstringOfTheOtherWithStripListenPathDisabledAndStripSlashEnabled(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	localClient := test.NewClientLocal()
+
+	mockServerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverA"}`))
+	}))
+	defer mockServerA.Close()
+
+	mockServerB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"match":"serverB"}`))
+	}))
+	defer mockServerB.Close()
+
+	t.Run("all true", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict routes false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("prefix and suffix match false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and suffix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = true
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("strict and prefix  false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = true
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+	t.Run("all false", func(t *testing.T) {
+		globalConf := ts.Gw.GetConfig()
+		globalConf.EnableCustomDomains = true
+
+		globalConf.HttpServerOptions.EnableStrictRoutes = false
+		globalConf.HttpServerOptions.EnablePathSuffixMatching = false
+		globalConf.HttpServerOptions.EnablePathPrefixMatching = false
+
+		ts.Gw.SetConfig(globalConf)
+		defer ts.ResetTestConfig()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "/test-classic"
+				spec.Proxy.TargetURL = mockServerA.URL
+				spec.Domain = "tyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+			func(spec *APISpec) {
+				spec.APIID = "api-b"
+				spec.Proxy.ListenPath = "/test-classic-extended"
+				spec.Proxy.PreserveHostHeader = true
+				spec.Proxy.TargetURL = mockServerB.URL
+				spec.Domain = "tyktyktest.io"
+				spec.Proxy.DisableStripSlash = false
+				spec.Proxy.StripListenPath = true
+			},
+		)
+
+		_, _ = ts.Run(t, []test.TestCase{
+			{Client: localClient, Code: 200, Path: "/test-classic", Domain: "tyktest.io", BodyMatch: `{"match":"serverA"}`},
+			{Client: localClient, Code: 200, Path: "/test-classic-extended", Domain: "tyktyktest.io", BodyMatch: `{"match":"serverB"}`},
+		}...)
+	})
+
+}
+
+// extra4 - end
+/// enable strip slash and disable strip listenpath section (both DisableStripSlash and  StripListenPath set to false) - end
+// 4th section --end
+
+func TestSortAPISpecs(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []*APISpec
+		expected []*APISpec
+	}{
+		{
+			name: "APIs should be sorted by listen path, however if the domain is empty they should sit at the end",
+			input: []*APISpec{
+				{APIDefinition: &apidef.APIDefinition{Domain: "{domains:tyk.io}", Proxy: apidef.ProxyConfig{ListenPath: "/path-longer"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/path-longer"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/a"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "abc.def.ghi", Proxy: apidef.ProxyConfig{ListenPath: "/b"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/longerpath"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/short"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "samelength1.com", Proxy: apidef.ProxyConfig{ListenPath: "/a"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "samelength2.com", Proxy: apidef.ProxyConfig{ListenPath: "/b"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/path"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "", Proxy: apidef.ProxyConfig{ListenPath: "/aaaaaaaaaaaaaaaaaaaa"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/b"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "{domains:tyk.io}", Proxy: apidef.ProxyConfig{ListenPath: "/path"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "{domains:tyk.io|abc.def.ghi}", Proxy: apidef.ProxyConfig{ListenPath: "/path"}}},
+			},
+			expected: []*APISpec{
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/path-longer"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "{domains:tyk.io}", Proxy: apidef.ProxyConfig{ListenPath: "/path-longer"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/longerpath"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/short"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/path"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "{domains:tyk.io|abc.def.ghi}", Proxy: apidef.ProxyConfig{ListenPath: "/path"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "{domains:tyk.io}", Proxy: apidef.ProxyConfig{ListenPath: "/path"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "samelength1.com", Proxy: apidef.ProxyConfig{ListenPath: "/a"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "samelength2.com", Proxy: apidef.ProxyConfig{ListenPath: "/b"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/b"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "abc.def.ghi", Proxy: apidef.ProxyConfig{ListenPath: "/b"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "tyk.io", Proxy: apidef.ProxyConfig{ListenPath: "/a"}}},
+				{APIDefinition: &apidef.APIDefinition{Domain: "", Proxy: apidef.ProxyConfig{ListenPath: "/aaaaaaaaaaaaaaaaaaaa"}}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sortSpecsByListenPath(tt.input)
+			for i, spec := range tt.input {
+				if spec.Domain != tt.expected[i].Domain {
+					t.Errorf("expected %v, got %v", tt.expected[i].Domain, spec.Domain)
+				}
+				if spec.Proxy.ListenPath != tt.expected[i].Proxy.ListenPath {
+					t.Errorf("expected %v, got %v", tt.expected[i].Proxy.ListenPath, spec.Proxy.ListenPath)
+				}
+
+			}
+		})
+
+	}
+}
+
+func TestAPILoaderValidation(t *testing.T) {
+	ts := StartTest(nil)
+	t.Cleanup(ts.Close)
+
+	t.Run("invalid regexps", func(t *testing.T) {
+		cleanup := func() {
+			if e := recover(); e != nil {
+				t.Logf("Caught panic, shouldn't have: %+v", e)
+				t.Fail()
+			}
+		}
+		defer cleanup()
+
+		ts.Gw.BuildAndLoadAPI(
+			func(spec *APISpec) {
+				spec.APIID = "api-a"
+				spec.Proxy.ListenPath = "{/test-classic}"
+				spec.Proxy.TargetURL = "http://httpbin"
+				spec.Domain = "{subdomain:tyktest.io}"
+				spec.Proxy.DisableStripSlash = true
+				spec.Proxy.StripListenPath = true
+			},
+		)
+	})
 }
